@@ -480,8 +480,8 @@ function botManageKeyboard(name) {
   if (b?.status === 'online' || b?.status === 'connecting') kb.text('Disconnect', `disconnect:${name}`);
   else kb.text('Reconnect', `reconnect:${name}`);
   kb.text('Console', `console:${name}`).text('Hotbar', `hotbar:${name}`).row();
-  kb.text('📸 Screenshot', `shot:${name}`).row();
-  kb.text(`🍖 Auto-Eat: ${b?.autoEat ? 'ON' : 'OFF'}`, `autoeat:${name}`).row();
+  kb.text('Screenshot', `shot:${name}`).row();
+  kb.text(`Auto-Eat: ${b?.autoEat ? 'ON' : 'OFF'}`, `autoeat:${name}`).row();
   kb.text(`Anti-AFK: ${AFK_LABEL[b?.afkMode || 'off']}`, `afk:${name}`).row();
   kb.text(b?.loginCmd ? 'Auto-login' : 'Set auto-login', `login:${name}`).row();
   kb.text('Neocraft', `neocraft:${name}`).row();
@@ -1829,13 +1829,13 @@ bot.on('callback_query:data', async ctx => {
       if (info.status !== 'online' || !info.mcBot) {
         return answer(`⚠️ ${info.name} is ${info.status} — connect it first.`);
       }
-      if (info.shotBusy) return answer('📸 Already rendering — wait a moment.');
+      if (info.shotBusy) return answer('Already rendering — wait a moment.');
       info.shotBusy = true;
-      await answer('📸 Rendering 4 views…');
+      await answer('Rendering 4 views…');
       try {
         const viewer = require('./viewer');
         const shots = await viewer.takeFourScreenshots(info);
-        const caption = `📸 <b>${esc(name)}</b> — 4 directions from where it stands\n` +
+        const caption = `<b>${esc(name)}</b> — 4 directions from where it stands\n` +
           shots.map((s, i) => `${i + 1}. ${s.label}`).join(' · ');
         // Album: one message, four photos. Caption lives on the first item.
         const media = shots.map((s, i) => ({
@@ -1852,7 +1852,7 @@ bot.on('callback_query:data', async ctx => {
       } catch (e) {
         // A broken GL context won't recover — drop the cached renderer.
         try { require('./viewer').destroyViewer(info); } catch (_) {}
-        notify(chatId, `📸 <b>${esc(name)}</b> — screenshot failed:\n<code>${esc(e.message)}</code>`);
+        notify(chatId, `<b>${esc(name)}</b> — screenshot failed:\n<code>${esc(e.message)}</code>`);
       } finally {
         info.shotBusy = false;
       }
@@ -1864,8 +1864,8 @@ bot.on('callback_query:data', async ctx => {
       saveData();
       await edit(botManageText(info), botManageKeyboard(name));
       return answer(info.autoEat
-        ? `🍖 Auto-Eat on — eats when hunger ≤ ${autoEat.EAT_AT_FOOD}/20`
-        : '🍖 Auto-Eat off');
+        ? `Auto-Eat on — eats when hunger ≤ ${autoEat.EAT_AT_FOOD}/20`
+        : 'Auto-Eat off');
     }
 
     case 'neocraft':
