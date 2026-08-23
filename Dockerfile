@@ -19,7 +19,7 @@ WORKDIR /app
 COPY package.json package-lock.json ./
 RUN npm ci --omit=dev && npm cache clean --force
 
-COPY index.js antibot.js viewer.js ./
+COPY index.js antibot.js autoeat.js viewer.js ./
 
 # Fall back to a writable path if no volume is mounted, so the container still
 # boots (state is then lost on redeploy, which is the expected trade-off).
