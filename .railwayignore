@@ -1,0 +1,6 @@
+node_modules/
+*.log
+.env.local
+userdata.json
+userdata.backup.json
+_probe.js

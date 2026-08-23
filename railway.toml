@@ -1,0 +1,10 @@
+[build]
+builder = "NIXPACKS"
+
+[deploy]
+startCommand = "node index.js"
+restartPolicyType = "ON_FAILURE"
+restartPolicyMaxRetries = 10
+
+# Set DATA_DIR to a mounted volume path (e.g. /data) or userdata.json is wiped
+# on every deploy.

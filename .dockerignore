@@ -1,0 +1,16 @@
+node_modules
+npm-debug.log
+*.log
+.env
+.env.local
+userdata.json
+userdata.json.tmp
+userdata.backup.json
+_probe.js
+README.md
+LICENSE
+.git
+.gitignore
+railway.toml
+.railwayignore
+Procfile
