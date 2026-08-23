@@ -9,7 +9,7 @@ ENV NODE_ENV=production \
     DATA_DIR=/data
 
 RUN apt-get update && apt-get install -y --no-install-recommends \
-      xvfb libgl1 libglu1-mesa libxi6 \
+      xvfb xauth libgl1 libglu1-mesa libxi6 \
       libcairo2 libpango-1.0-0 libjpeg62-turbo libgif7 librsvg2-2 \
     && rm -rf /var/lib/apt/lists/*
 
