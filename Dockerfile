@@ -19,7 +19,7 @@ WORKDIR /app
 COPY package.json package-lock.json ./
 RUN npm ci --omit=dev && npm cache clean --force
 
-COPY index.js antibot.js autoeat.js viewer.js web.js README.md ./
+COPY index.js antibot.js autoeat.js viewer.js web.js ./
 
 # Start Xvfb ourselves instead of xvfb-run: xvfb-run has failed silently on
 # some platforms (missing xauth, display lock races) and swallowed node's logs.
