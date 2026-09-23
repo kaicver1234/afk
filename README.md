@@ -13,9 +13,11 @@
 
 ---
 
-## 🤖 McAfk, Afk minecraft player — Telegram Bot
+## 🤖 McAfk — Mineflayer Bot Manager
 
-A Node.js Telegram bot that connects fake offline (cracked) players to Minecraft servers and forwards in-game chat to Telegram group chats. Manage multiple bots from your phone with a fully inline-keyboard UI — no complicated commands needed.
+A Node.js Mineflayer manager that connects offline-mode players to Minecraft servers and lets you operate them from Telegram **or an authenticated web dashboard**. The web panel provides live status, position/health/food, chat, movement controls, camera look, hotbar/inventory, reconnect/disconnect, screenshots and bot lifecycle management.
+
+Mineflayer is the underlying high-level Minecraft client; this project is an operations layer around its bot, world, physics, inventory and chat APIs.
 
 ---
 ## 📱 **Telegram Interface**
@@ -49,6 +51,8 @@ Minecraft chat appears in your Telegram group:
 - **Auto-reconnect** with exponential backoff (5 s → 10 s → 20 s → 40 s → 60 s)
 - **Chat forwarding** — pipe Minecraft server chat to Telegram group chats in real time, batched so busy servers don't hit Telegram's rate limit
 - **Inline keyboard UI** — everything controlled through Telegram buttons; no slash commands needed in private chat
+- **Authenticated web control panel** 🌐 — open `/` on `WEB_PORT`, enter `WEB_TOKEN`, and control every bot from a browser
+- **REST API** — `/api/bots` exposes status and controlled actions for custom frontends or automation
 - **Detailed status** — uptime, server address, version, anti-AFK mode, login state, last error per bot
 - **Survives restarts** — bots, anti-AFK settings and login commands are saved to disk; disconnected bots come back as disconnected, not silently forgotten
 
@@ -119,6 +123,25 @@ You should see:
 ```
 
 ---
+
+### Web dashboard
+
+The same process serves a Persian RTL dashboard by default on port `3000` (or Railway's `PORT`). Set a strong token before starting:
+
+```bash
+WEB_PORT=3000
+WEB_TOKEN=replace-with-a-long-random-secret
+npm start
+```
+
+Then open `http://localhost:3000/` and enter `WEB_TOKEN`. The API requires `Authorization: Bearer <WEB_TOKEN>` on every `/api/*` request. Keep the panel behind HTTPS/VPN/reverse-proxy authentication when exposing it to the public internet; never leave it on an untrusted network without a strong token.
+
+Available web controls include:
+
+- add/remove/reconnect/disconnect bots
+- live connection, coordinates, dimension, health, hunger and uptime
+- chat/commands, movement buttons, jump/sneak/sprint, stop, and look direction
+- hotbar slot, inventory, screenshot, anti-AFK, auto-eat and saved login actions via REST
 
 ### Option B: Deploy to Railway 🚂
 

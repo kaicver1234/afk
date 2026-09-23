@@ -32,19 +32,25 @@ function ensureLoaded() {
 
 const WIDTH = 512;
 const HEIGHT = 512;
-const VIEW_DISTANCE = 2;          // chunks — keep small, memory budget is tight
-const SETTLE_MS = 120;            // camera position tween (~50ms) + chunk meshes
+const VIEW_DISTANCE = 3;          // chunks — 5×5 columns around the bot
+const SETTLE_MS = 25;             // let the GL queue drain between shots
+const TEXTURE_TIMEOUT_MS = 10000; // block atlas loads async; don't shoot untextured
 const INIT_TIMEOUT_MS = 60000;
 
-// Minecraft yaw: 0 = south (+Z), positive counter-clockwise viewed from above.
-const COMPASS = [
-  { label: 'South', yaw: 0 },
-  { label: 'West', yaw: Math.PI / 2 },
-  { label: 'North', yaw: Math.PI },
-  { label: 'East', yaw: -Math.PI / 2 },
+// Body-relative views, in order. Turns are applied to the THREE camera yaw,
+// where +90° is a left turn (camera basis looks down -Z at yaw 0).
+const RELATIVE_TURNS = [
+  { label: 'Front', turn: 0 },
+  { label: 'Left', turn: Math.PI / 2 },
+  { label: 'Right', turn: -Math.PI / 2 },
+  { label: 'Back', turn: Math.PI },
 ];
 
 const wait = ms => new Promise(r => setTimeout(r, ms));
+
+function floored(pos) {
+  return { x: Math.floor(pos.x), y: Math.floor(pos.y), z: Math.floor(pos.z) };
+}
 
 function withTimeout(promise, ms, what) {
   return Promise.race([
@@ -86,18 +92,40 @@ async function getRenderer(info) {
   worldView.listenToBot(mc);
   await withTimeout(worldView.init(mc.entity.position), INIT_TIMEOUT_MS, 'World load');
   await withTimeout(viewer.world.waitForChunksToRender(), INIT_TIMEOUT_MS, 'Chunk render');
+  await waitForTextures(viewer);
+
+  // The first draw on headless-gl compiles shaders and uploads buffers and can
+  // come out as an empty frame — prime the pipeline once before real captures.
+  try { renderer.render(viewer.scene, viewer.camera); } catch (_) {}
+  await wait(100);
 
   info.viewer = { forMc: mc, canvas, renderer, viewer, worldView };
   return info.viewer;
 }
 
-// One JPEG from the bot's eyes. Absolute yaw so each shot faces a compass point.
+// The block atlas is loaded off-thread and assigned to the shared material
+// whenever it lands. Rendering before that gives flat-coloured blocks.
+function waitForTextures(viewer) {
+  if (viewer.world.material.map) return Promise.resolve();
+  return withTimeout(new Promise((resolve, reject) => {
+    const check = setInterval(() => {
+      if (viewer.world.material.map) { clearInterval(check); resolve(); }
+    }, 100);
+    setTimeout(() => { clearInterval(check); reject(new Error('Block textures did not load')); }, TEXTURE_TIMEOUT_MS);
+  }), TEXTURE_TIMEOUT_MS + 2000, 'Texture load');
+}
+
+// One JPEG from the bot's eyes. Camera position is set directly (the tween-based
+// setFirstPersonCamera would leave it at its old spot — TWEEN only advances when
+// updated every frame), so shots always come from where the player stands.
 async function shootOne(R, position, yaw, pitch) {
-  R.viewer.setFirstPersonCamera(position, yaw, pitch);
-  R.viewer.update();
-  await wait(SETTLE_MS);
+  const cam = R.viewer.camera;
+  cam.position.set(position.x, position.y + R.viewer.playerHeight, position.z);
+  cam.rotation.set(pitch, yaw, 0, 'ZYX');
+  cam.updateMatrixWorld();
   R.renderer.render(R.viewer.scene, R.viewer.camera);
-  return getBufferFromStreamSafe(R.renderer.domElement.createJPEGStream({ quality: 90 }));
+  await wait(SETTLE_MS);
+  return getBufferFromStreamSafe(R.renderer.domElement.createJPEGStream({ quality: 92 }));
 }
 
 async function getBufferFromStreamSafe(stream) {
@@ -105,19 +133,36 @@ async function getBufferFromStreamSafe(stream) {
   return withTimeout(getBufferFromStream(stream), 15000, 'Image encode');
 }
 
-// Four clean shots from where the player stands, facing N/E/S/W.
-// Returns [{ buffer, label }, ...]. Never moves the player; restores its yaw after.
+// Four shots from exactly where the bot stands: forward as it currently
+// faces, then left, right, behind. Returns [{ buffer, label }, ...].
+// Never moves the player; restores its yaw after.
 async function takeFourScreenshots(info) {
   ensureLoaded();
   const R = await getRenderer(info);
   const mc = info.mcBot;
   if (!mc || info.status !== 'online') throw new Error('Bot went offline during render');
 
-  const pos = mc.entity.position.clone();
+  // The cached renderer may hold the world as it looked when it was built —
+  // after a teleport or a respawn that's the wrong place entirely. Re-sync the
+  // loaded chunks with where the player actually is before shooting.
+  try {
+    await withTimeout(R.worldView.updatePosition(mc.entity.position, true), INIT_TIMEOUT_MS, 'Chunk refresh');
+    await withTimeout(R.viewer.waitForChunksToRender(), INIT_TIMEOUT_MS, 'Chunk render');
+  } catch (e) {
+    // A half-finished refresh can leave the scene inconsistent — rebuild next time.
+    destroyViewer(info);
+    throw new Error(`Screenshot chunk refresh failed: ${e.message}`);
+  }
+
+  const pos = floored(mc.entity.position);
+  // mineflayer's entity.yaw is already in the THREE camera convention (the
+  // viewer's own examples feed bot.entity.yaw straight into camera.rotation):
+  // yaw 0 faces -Z, +PI/2 faces -X. So a positive turn of PI/2 looks LEFT.
+  const baseYaw = mc.entity.yaw || 0;
   const out = [];
   try {
-    for (const dir of COMPASS) {
-      const buf = await shootOne(R, pos, dir.yaw, 0);
+    for (const dir of RELATIVE_TURNS) {
+      const buf = await shootOne(R, pos, baseYaw + dir.turn, 0);
       out.push({ buffer: buf, label: dir.label });
     }
   } catch (e) {
@@ -135,7 +180,9 @@ function destroyViewer(info) {
   const v = info.viewer;
   if (!v) return;
   info.viewer = null;
-  try { v.worldView?.removeListeners?.(v.worldView.bot); } catch (_) {}
+  // Detach from the bot with the same helper that attached, so a rebuilt
+  // viewer doesn't stack duplicate listeners on the same connection.
+  try { if (v.forMc && v.worldView) v.worldView.removeListenersFromBot(v.forMc); } catch (_) {}
   try { v.worldView?.removeAllListeners?.(); } catch (_) {}
   try {
     v.renderer.dispose();

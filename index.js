@@ -2,12 +2,12 @@
 
 const { Bot, InlineKeyboard, InputFile } = require('grammy');
 const mineflayer = require('mineflayer');
-const { MapCaptcha, findVerifyCommand, VERIFY_HINT_RE, DEFAULT_FINGERPRINT,
-  isCooldownKick, parseCooldownMs } = require('./antibot');
+const { DEFAULT_FINGERPRINT, isCooldownKick, parseCooldownMs } = require('./antibot');
 const autoEat = require('./autoeat');
 const fs = require('fs');
 const net = require('net');
 const path = require('path');
+const { startWeb } = require('./web');
 
 // Load .env into process.env without pulling in a dependency.
 // Real environment variables always win, so a service definition can override the file.
@@ -68,9 +68,13 @@ function saveData() {
       loginEnabled: b.loginEnabled !== false,
       ncLogin: b.ncLogin || null,
       ncSecond: b.ncSecond || null,
+      ncThird: b.ncThird || null,
       ncEnabled: b.ncEnabled === true,
       afkMode: b.afkMode || 'off',
       afkIntervalMs: b.afkIntervalMs || DEFAULT_AFK_INTERVAL_MS,
+      autoChatMsg: b.autoChatMsg || null,
+      autoChatEnabled: b.autoChatEnabled !== false,
+      autoChatIntervalMs: b.autoChatIntervalMs || DEFAULT_AUTOCHAT_INTERVAL_MS,
       autoEat: b.autoEat === true,
       // A restart must not hand the server a fresh join inside a cooldown it set.
       cooldownUntil: b.cooldownUntil && b.cooldownUntil > Date.now() ? b.cooldownUntil : 0,
@@ -98,9 +102,13 @@ function loadData() {
         loginEnabled: b.loginEnabled !== false,
         ncLogin: b.ncLogin || null,
         ncSecond: b.ncSecond || null,
+        ncThird: b.ncThird || null,
         ncEnabled: b.ncEnabled === true,
         afkMode: AFK_MODES.has(b.afkMode) ? b.afkMode : 'off',
         afkIntervalMs: clampInterval(b.afkIntervalMs),
+        autoChatMsg: typeof b.autoChatMsg === 'string' && b.autoChatMsg ? b.autoChatMsg : null,
+        autoChatEnabled: b.autoChatEnabled !== false,
+        autoChatIntervalMs: clampChatInterval(b.autoChatIntervalMs),
         autoEat: b.autoEat === true,
       };
       const cooldownUntil = Number(b.cooldownUntil) || 0;
@@ -228,7 +236,7 @@ const stripCodes = s => String(s)
 // Telegram commands owned by this bot — never relayed to Minecraft.
 const RESERVED = new Set([
   'start', 'help', 'forward', 'unforward', 'forwards',
-  'cmd', 'say', 'use', 'console', 'bots', 'afk', 'setlogin', 'click',
+  'cmd', 'say', 'use', 'console', 'bots', 'afk', 'setlogin', 'click', 'where',
 ]);
 const MC_MAX_LEN = 256;
 const SEND_GAP_MS = 400;
@@ -245,6 +253,10 @@ const AFK_LABEL = { off: 'Off', jump: 'Jump only', walk: 'Walk 1 block', both: '
 const DEFAULT_AFK_INTERVAL_MS = 60000;
 const MIN_AFK_INTERVAL_MS = 5000;
 const MAX_AFK_INTERVAL_MS = 30 * 60 * 1000;
+// --- auto-chat (scheduled message) ---
+const DEFAULT_AUTOCHAT_INTERVAL_MS = 30 * 60 * 1000;   // 30 minutes
+const MIN_AUTOCHAT_INTERVAL_MS = 60 * 1000;            // never faster than 1/min — spam kicks
+const MAX_AUTOCHAT_INTERVAL_MS = 24 * 60 * 60 * 1000;  // 24h ceiling
 // One block at walking speed is ~230ms; a little more guarantees the full block.
 const AFK_STEP_MS = 350;
 const AFK_JUMP_MS = 500;
@@ -276,6 +288,29 @@ function parseInterval(raw) {
   return Math.round(ms);
 }
 
+// "20", "45m", "2h", "1h30m", "90m" → ms. A bare number means minutes here —
+// auto-chat intervals are minutes-to-hours, not seconds.
+function parseChatInterval(raw) {
+  const s = String(raw).trim().toLowerCase();
+  if (!s) return null;
+  let total = 0, matched = false;
+  const re = /(\d+(?:\.\d+)?)\s*(h|hr|hrs|hour|hours|m|min|mins|minute|minutes|s|sec|secs|second|seconds)?/g;
+  let m;
+  while ((m = re.exec(s)) !== null) {
+    if (m[0] === '') break;
+    const n = parseFloat(m[1]);
+    if (!Number.isFinite(n) || n <= 0) return null;
+    const unit = m[2] || 'm';
+    if (unit.startsWith('h')) total += n * 3600000;
+    else if (unit.startsWith('s')) total += n * 1000;
+    else total += n * 60000;
+    matched = true;
+  }
+  if (!matched) return null;
+  if (total < MIN_AUTOCHAT_INTERVAL_MS || total > MAX_AUTOCHAT_INTERVAL_MS) return null;
+  return Math.round(total);
+}
+
 // --- auto-login ---
 // Servers running AuthMe/nLogin ask for /login after every join. We replay the
 // saved command when the server prompts, and once as a fallback if it never does.
@@ -289,16 +324,6 @@ const LOGIN_RETRY_MS = 6000;
 const FLUSH_MS = 2500;
 const MAX_BATCH_LINES = 25;
 const MAX_BATCH_CHARS = 3500;
-
-// --- antibot / verification ---
-// Servers that run an antibot hold new joins in a verification lobby: they send a
-// title, an action-bar line, a chat instruction, or a map-rendered captcha, and
-// kick anyone who doesn't answer. We surface all of that to Telegram, and when
-// the server states the answer in plain text we replay it ourselves.
-const VERIFY_RELAY_MS = 120000;      // how long after join we treat titles/action bars as antibot traffic
-const VERIFY_AUTO_MAX = 3;           // don't spam a command the server ignores
-const VERIFY_AUTO_GAP_MS = 2500;     // minimum spacing between auto-verify attempts
-const VERIFY_DEDUPE_MS = 8000;       // same instruction seen twice → relay once
 
 // Writing "auto" as the version makes minecraft-protocol ping the server first and
 // join on whatever protocol it reports. Useful when a proxy (Via*) answers for
@@ -454,7 +479,6 @@ function botListKeyboard(ctx) {
 function botManageText(b) {
   const ut = b.connectedAt && b.status === 'online' ? `\n<b>Uptime:</b> ${uptime(Date.now() - b.connectedAt)}` : '';
   const err = b.error ? `\n<b>Last event:</b> <code>${esc(b.error)}</code>` : '';
-  const vf = b.verifyLastCmd ? `\n<b>AntiBot:</b> answered <code>${esc(b.verifyLastCmd)}</code>` : '';
   const cd = b.cooldownUntil && b.cooldownUntil > Date.now()
     ? `\n<b>AntiBot cooldown:</b> ${humanInterval(b.cooldownUntil - Date.now())} left (refusals: ${b.cooldownWaits || 1})`
     : '';
@@ -466,7 +490,10 @@ function botManageText(b) {
   const login = b.loginCmd
     ? `\n<b>Auto-login:</b> ${b.loginEnabled === false ? 'saved but <b>disabled</b>' : 'on'} - <code>${esc(maskLogin(b.loginCmd))}</code>`
     : `\n<b>Auto-login:</b> not set`;
-  return `${dot(b.status)} <b>${esc(b.name)}</b>  <i>(${esc(ownerTag(b))})</i>\n\n<b>Server:</b> <code>${esc(b.host)}:${b.port}</code>\n<b>Version:</b> <code>${esc(b.version)}</code>\n<b>Status:</b> <b>${b.status}</b>${ut}${food}${eat}${afk}${login}${vf}${cd}${err}`;
+  const ac = b.autoChatMsg
+    ? `\n<b>Auto-chat:</b> ${b.autoChatEnabled === false ? 'saved but <b>paused</b>' : 'on'} - every <b>${humanInterval(clampChatInterval(b.autoChatIntervalMs))}</b>`
+    : `\n<b>Auto-chat:</b> not set`;
+  return `${dot(b.status)} <b>${esc(b.name)}</b>  <i>(${esc(ownerTag(b))})</i>\n\n<b>Server:</b> <code>${esc(b.host)}:${b.port}</code>\n<b>Version:</b> <code>${esc(b.version)}</code>\n<b>Status:</b> <b>${b.status}</b>${ut}${food}${eat}${afk}${login}${ac}${cd}${err}`;
 }
 
 // Never echo the password back into a chat log in full.
@@ -480,10 +507,11 @@ function botManageKeyboard(name) {
   if (b?.status === 'online' || b?.status === 'connecting') kb.text('Disconnect', `disconnect:${name}`);
   else kb.text('Reconnect', `reconnect:${name}`);
   kb.text('Console', `console:${name}`).text('Hotbar', `hotbar:${name}`).row();
-  kb.text('Screenshot', `shot:${name}`).row();
+  kb.text('📸 Screenshot', `shot:${name}`).row();
   kb.text(`Auto-Eat: ${b?.autoEat ? 'ON' : 'OFF'}`, `autoeat:${name}`).row();
   kb.text(`Anti-AFK: ${AFK_LABEL[b?.afkMode || 'off']}`, `afk:${name}`).row();
   kb.text(b?.loginCmd ? 'Auto-login' : 'Set auto-login', `login:${name}`).row();
+  kb.text(`Auto-chat: ${b?.autoChatMsg ? (b?.autoChatEnabled === false ? 'PAUSED' : 'ON') : 'OFF'}`, `ac:${name}`).row();
   kb.text('Neocraft', `neocraft:${name}`).row();
   return kb.text('Remove', `confirm_remove:${name}`).text('Refresh', `manage:${name}`).row().text('< Back', 'list_bots');
 }
@@ -548,20 +576,83 @@ function loginMenuKeyboard(name) {
   return kb.text('< Back', `manage:${name}`);
 }
 
+function acMenuText(b) {
+  const iv = humanInterval(clampChatInterval(b.autoChatIntervalMs));
+  if (!b.autoChatMsg) {
+    return `<b>Auto-chat - ${esc(b.name)}</b>\n\nNo message saved yet.\n\nThe bot repeats a message in server chat on a fixed interval - useful for reminders, keep-alive chatter or any command.\n\n<b>Every:</b> ${iv}\n\nSet a message first, then pick an interval:`;
+  }
+  return `<b>Auto-chat - ${esc(b.name)}</b>\n\n<b>Message:</b> <code>${esc(b.autoChatMsg)}</code>\n<b>Every:</b> ${iv}\n<b>Status:</b> ${b.autoChatEnabled === false ? 'paused' : 'running'}\n\nSent only while the bot is online. Start the message with <code>/</code> and it runs as a command.`;
+}
+
+function acMenuKeyboard(name) {
+  const b = mcBots.get(name);
+  const iv = b?.autoChatIntervalMs || DEFAULT_AUTOCHAT_INTERVAL_MS;
+  const ivMark = ms => (ms === iv ? '[*] ' : '');
+  const kb = new InlineKeyboard()
+    .text(b?.autoChatMsg ? '✏️ Change message' : '✏️ Set message', `acmsg:${name}`).row()
+    .text(`${ivMark(600000)}10m`, `acint:${name}:600000`).text(`${ivMark(1800000)}30m`, `acint:${name}:1800000`).row()
+    .text(`${ivMark(3600000)}1h`, `acint:${name}:3600000`).text(`${ivMark(7200000)}2h`, `acint:${name}:7200000`).row()
+    .text('Custom interval', `accustom:${name}`).row();
+  if (b?.autoChatMsg) {
+    if (b?.status === 'online') kb.text('▶️ Send now', `acnow:${name}`).row();
+    kb.text(b?.autoChatEnabled === false ? '▶️ Resume' : '⏸ Pause', `actoggle:${name}`).text('🗑 Clear', `acclear:${name}`).row();
+  }
+  return kb.text('< Back', `manage:${name}`);
+}
+
 function neocraftMenuText(b) {
   const status = b.ncEnabled === true ? 'enabled' : 'disabled';
   const login = b.ncLogin ? `<code>${esc(maskLogin(b.ncLogin))}</code>` : '<i>not set</i>';
   const second = b.ncSecond ? `<code>${esc(b.ncSecond)}</code>` : '<i>not set</i>';
-  return `<b>Neocraft server - ${esc(b.name)}</b>\n\nOn every join it logs in, then switches you into survival.\n\n<b>Login command:</b> ${login}\n<b>2nd command:</b> ${second}\n<b>Status:</b> ${status}\n\nTiming: login ~2s after joining (or right after an antibot challenge clears), 2nd command ~5-6s after that.`;
+  const third = b.ncThird ? `<code>${esc(b.ncThird)}</code>` : '<i>not set</i>';
+  return `<b>Neocraft server - ${esc(b.name)}</b>\n\nOn every join it logs in, switches you into survival, then runs a 3rd command 5 minutes later.\n\n<b>Login command:</b> ${login}\n<b>2nd command:</b> ${second}\n<b>3rd command (after 5 min):</b> ${third}\n<b>Status:</b> ${status}\n\nTiming: login ~2s after joining, 2nd command 10s after that, 3rd command 5 minutes after the 2nd.\nRuns once per connection and announces each step here.`;
 }
 
 function neocraftMenuKeyboard(name) {
   const b = mcBots.get(name);
   const kb = new InlineKeyboard();
   kb.text(b?.ncLogin ? 'Change login' : 'Set login', `ncsetlogin:${name}`).text(b?.ncSecond ? 'Change 2nd cmd' : 'Set 2nd cmd', `ncsetsecond:${name}`).row();
+  kb.text(b?.ncThird ? 'Change 3rd cmd' : 'Set 3rd cmd (5 min)', `ncsetthird:${name}`).row();
   kb.text(b?.ncEnabled ? 'Disable' : 'Enable', `nctoggle:${name}`).row();
-  if (b?.ncLogin || b?.ncSecond) kb.text('Clear', `ncclear:${name}`).row();
+  if (b?.ncLogin || b?.ncSecond || b?.ncThird) kb.text('Clear', `ncclear:${name}`).row();
   return kb.text('< Back', `manage:${name}`);
+}
+
+// --- auto-chat (scheduled message) ---
+// Repeats a saved message (or command) in server chat on a fixed interval.
+// Sends go through the shared send queue.
+
+const clampChatInterval = ms => {
+  const n = Number(ms);
+  if (!Number.isFinite(n) || n <= 0) return DEFAULT_AUTOCHAT_INTERVAL_MS;
+  return Math.min(Math.max(Math.round(n), MIN_AUTOCHAT_INTERVAL_MS), MAX_AUTOCHAT_INTERVAL_MS);
+};
+
+function stopAutoChat(info) {
+  if (info.autoChatTimer) { clearTimeout(info.autoChatTimer); info.autoChatTimer = null; }
+}
+
+function autoChatTick(info) {
+  const live = mcBots.get(info.name);
+  // A respawned bot object replaces this one; let that one own the timer.
+  if (!live || live !== info) return;
+  if (!info.autoChatMsg || info.autoChatEnabled === false) return;
+  if (info.status === 'online' && info.mcBot) {
+    try { queueSend(info, info.autoChatMsg); }
+    catch (e) { info.error = `Auto-chat: ${e.message}`; }
+  }
+  scheduleAutoChat(info);
+}
+
+// (Re)arm the repeating auto-chat send for this bot. The interval carries ±10%
+// jitter so the timing doesn't look machine-made to players or plugins.
+function scheduleAutoChat(info) {
+  stopAutoChat(info);
+  if (!info.autoChatMsg || info.autoChatEnabled === false) return;
+  const base = clampChatInterval(info.autoChatIntervalMs);
+  const jitter = Math.floor(base * 0.1);
+  const delay = base + (jitter ? Math.floor((Math.random() - 0.5) * jitter * 2) : 0);
+  info.autoChatTimer = setTimeout(() => autoChatTick(info), delay);
 }
 
 function stopAfk(info) {
@@ -583,6 +674,8 @@ function stopLogin(info) {
 function stopNeocraft(info) {
   if (info.ncTimer1) { clearTimeout(info.ncTimer1); info.ncTimer1 = null; }
   if (info.ncTimer2) { clearTimeout(info.ncTimer2); info.ncTimer2 = null; }
+  if (info.ncTimer3) { clearTimeout(info.ncTimer3); info.ncTimer3 = null; }
+  info.ncFlowDone = false;
 }
 
 function destroyBot(info) {
@@ -593,7 +686,7 @@ function destroyBot(info) {
   stopAfk(info);
   stopLogin(info);
   stopNeocraft(info);
-  stopVerify(info);
+  stopAutoChat(info);
   if (info.eatDisposer) { try { info.eatDisposer(); } catch (_) {} info.eatDisposer = null; }
   try { require('./viewer').destroyViewer(info); } catch (_) {}
   if (info.mcBot) {
@@ -614,9 +707,6 @@ function afkPulse(info) {
   if (!mc || info.status !== 'online') return;
   const mode = info.afkMode || 'off';
   if (mode === 'off') return;
-  // Hold still while an antibot challenge is in flight — some of them fail a player
-  // that moves during the check.
-  if (verifyHold(info)) return;
 
   if (!info.afkStepTimers) info.afkStepTimers = [];
   const at = (ms, fn) => info.afkStepTimers.push(setTimeout(() => {
@@ -722,13 +812,16 @@ function setAfk(info, mode, intervalMs) {
 
 // Fire the saved login command. Jumps the send queue so it lands before anything
 // the user typed while the bot was still connecting.
+// When the Neocraft flow is enabled it owns the login command, so it takes
+// precedence over the plain auto-login one.
 function sendLogin(info, why) {
-  if (!info.loginCmd || info.loginEnabled === false) return false;
+  const cmd = (info.ncEnabled && info.ncLogin) ? info.ncLogin : info.loginCmd;
+  if (!cmd || info.loginEnabled === false) return false;
   if (info.status !== 'online' || !info.mcBot) return false;
   if (info.loginTries >= LOGIN_MAX_TRIES) return false;
   info.loginTries = (info.loginTries || 0) + 1;
   if (info.loginTimer) { clearTimeout(info.loginTimer); info.loginTimer = null; }
-  queueSend(info, info.loginCmd, true);
+  queueSend(info, cmd, true);
   info.error = `Auto-login sent (${why}, try ${info.loginTries})`;
 
   // If the server never confirms, try again — some plugins swallow the first attempt.
@@ -741,109 +834,57 @@ function sendLogin(info, why) {
   return true;
 }
 
-// Neocraft server auto-flow: log in, then switch into survival, with fixed delays.
+// --- neocraft timing ---
+const NC_LOGIN_DELAY_MS = 2000;        // login command this long after joining
+const NC_SECOND_DELAY_MS = 10000;      // 2nd command this long after the login
+const NC_THIRD_DELAY_MS = 5 * 60000;   // 3rd command 5 minutes after the 2nd (or the login if no 2nd)
+
+// Neocraft server auto-flow: log in, switch into survival, then run a 3rd
+// command after 5 minutes. Runs at most once per connection — a dimension
+// change re-emits 'spawn' and must not replay /login (and would otherwise loop
+// when the 2nd command swaps worlds).
 function sendNcFlow(info) {
   if (info.status !== 'online' || !info.mcBot) return;
+  if (info.ncFlowDone) return;
+  info.ncFlowDone = true;
   queueSend(info, info.ncLogin, true);
   info.error = 'Neocraft login sent';
+  notify(info.chatId, `🏰 <b>${esc(info.name)}</b> — login sent (<code>${esc(maskLogin(info.ncLogin))}</code>); <code>${esc(info.ncSecond || '')}</code> follows in ${NC_SECOND_DELAY_MS / 1000}s.`);
+  const armThird = from => {
+    if (!info.ncThird) return;
+    info.ncTimer3 = setTimeout(() => {
+      info.ncTimer3 = null;
+      if (info.status !== 'online' || !info.mcBot) return;
+      queueSend(info, info.ncThird);
+      info.error = 'Neocraft 3rd command sent';
+      notify(info.chatId, `🏰 <b>${esc(info.name)}</b> — 3rd command sent: <code>${esc(info.ncThird)}</code>`);
+    }, NC_THIRD_DELAY_MS - (Date.now() - from));
+  };
   if (info.ncSecond) {
-    const secondDelay = 5000 + Math.floor(Math.random() * 1000); // 5–6s after login
     info.ncTimer2 = setTimeout(() => {
       info.ncTimer2 = null;
       if (info.status !== 'online' || !info.mcBot) return;
       queueSend(info, info.ncSecond);
       info.error = 'Neocraft 2nd command sent';
-    }, secondDelay);
+      notify(info.chatId, `🏰 <b>${esc(info.name)}</b> — 2nd command sent: <code>${esc(info.ncSecond)}</code>${info.ncThird ? `; <code>${esc(info.ncThird)}</code> follows in ${NC_THIRD_DELAY_MS / 60000} min.` : ''}`);
+      armThird(Date.now());
+    }, NC_SECOND_DELAY_MS);
+  } else {
+    armThird(Date.now());
   }
 }
 
 function scheduleNeocraft(info) {
   if (!info.ncEnabled || !info.ncLogin) return;
+  if (info.ncFlowDone) return;
   if (info.ncTimer1) clearTimeout(info.ncTimer1);
   if (info.ncTimer2) clearTimeout(info.ncTimer2);
+  if (info.ncTimer3) clearTimeout(info.ncTimer3);
   info.ncTimer1 = setTimeout(() => {
     info.ncTimer1 = null;
     if (info.status !== 'online' || !info.mcBot) return;
-    // Don't fire the login into an antibot lobby — a pending challenge has to
-    // clear first, or the auth plugin never sees the command. Wait once, then send.
-    if (verifyHold(info)) {
-      info.ncTimer1 = setTimeout(() => {
-        info.ncTimer1 = null;
-        if (info.status !== 'online' || !info.mcBot) return;
-        sendNcFlow(info);
-      }, VERIFY_HOLD_MS);
-      return;
-    }
     sendNcFlow(info);
-  }, 2000);
-}
-
-// --- antibot verification ---
-// One place that decides what to do with anything that might be a verification
-// challenge, wherever it arrived from (chat, title, action bar, or a map image).
-//
-// Rule: we only ever send back a command the server itself printed. If the
-// challenge needs a human (an image captcha, a numeric puzzle, a click), we
-// forward it to Telegram and let the user answer with /cmd.
-function stopVerify(info) {
-  if (info.mapCaptcha) { info.mapCaptcha.clear(); info.mapCaptcha = null; }
-  info.verifySeen = null;
-  info.verifyPending = null;
-  info.verifyLastSeenAt = 0;
-}
-
-// True while a join is new enough that titles/action bars are probably the
-// antibot talking rather than normal gameplay HUD noise.
-const inVerifyWindow = info =>
-  info.connectedAt != null && Date.now() - info.connectedAt < VERIFY_RELAY_MS;
-
-// True right after a challenge was seen and before anything suggests we're through.
-// While this holds we keep the player still: several antibots score movement during
-// their check, and a bot that hops around mid-captcha fails it.
-const VERIFY_HOLD_MS = 15000;
-const verifyHold = info => !!info.verifyLastSeenAt && Date.now() - info.verifyLastSeenAt < VERIFY_HOLD_MS;
-
-function relayVerify(info, text, source) {
-  const clean = String(text || '').trim();
-  if (!clean) return;
-
-  // The same instruction usually arrives on several channels at once.
-  if (!info.verifySeen) info.verifySeen = new Map();
-  const now = Date.now();
-  for (const [k, t] of info.verifySeen) if (now - t > VERIFY_DEDUPE_MS) info.verifySeen.delete(k);
-  const key = clean.toLowerCase();
-  if (info.verifySeen.has(key)) return;
-  info.verifySeen.set(key, now);
-  info.verifyLastSeenAt = now;
-
-  notify(info.chatId, `🛡️ <b>${esc(info.name)}</b> — verification (${esc(source)}):\n<code>${esc(clean.slice(0, 500))}</code>`);
-  tryAutoVerify(info, clean);
-}
-
-function tryAutoVerify(info, text) {
-  const cmd = findVerifyCommand(text);
-  if (!cmd) return false;
-  if (info.status !== 'online' || !info.mcBot) {
-    // Challenge arrived while the join was still in the lobby — we can't chat yet,
-    // so keep the source line and re-run this once we're in.
-    info.verifyPending = text;
-    return false;
-  }
-
-  info.verifyTries = info.verifyTries || 0;
-  if (info.verifyTries >= VERIFY_AUTO_MAX) return false;
-  const now = Date.now();
-  if (info.verifyLastAt && now - info.verifyLastAt < VERIFY_AUTO_GAP_MS) return false;
-  // Never send the identical command twice — if it didn't work once, it won't now.
-  if (info.verifyLastCmd === cmd) return false;
-
-  info.verifyTries++;
-  info.verifyLastAt = now;
-  info.verifyLastCmd = cmd;
-  info.verifyPending = null;
-  queueSend(info, cmd, true);
-  notify(info.chatId, `🤖 <b>${esc(info.name)}</b> answered the antibot automatically:\n<code>${esc(cmd)}</code>`);
-  return true;
+  }, NC_LOGIN_DELAY_MS);
 }
 
 // How often to probe the outbound TCP path to the host while "online". Catches
@@ -935,17 +976,18 @@ async function spawnBot(name, host, port, version, chatId, ownerUsername, opts =
     loginTries: 0, loginDone: false, loginTimer: null, loginRetryTimer: null,
     ncLogin: opts.ncLogin !== undefined ? opts.ncLogin : (ex?.ncLogin ?? null),
     ncSecond: opts.ncSecond !== undefined ? opts.ncSecond : (ex?.ncSecond ?? null),
+    ncThird: opts.ncThird !== undefined ? opts.ncThird : (ex?.ncThird ?? null),
     ncEnabled: opts.ncEnabled !== undefined ? opts.ncEnabled : (ex?.ncEnabled === true),
-    ncTimer1: null, ncTimer2: null,
+    ncTimer1: null, ncTimer2: null, ncTimer3: null, ncFlowDone: false,
     afkMode: opts.afkMode !== undefined ? opts.afkMode : (ex?.afkMode ?? 'off'),
     afkIntervalMs: clampInterval(opts.afkIntervalMs !== undefined ? opts.afkIntervalMs : ex?.afkIntervalMs),
+    autoChatMsg: opts.autoChatMsg !== undefined ? opts.autoChatMsg : (ex?.autoChatMsg ?? null),
+    autoChatEnabled: opts.autoChatEnabled !== undefined ? opts.autoChatEnabled : (ex?.autoChatEnabled !== false),
+    autoChatIntervalMs: clampChatInterval(opts.autoChatIntervalMs !== undefined ? opts.autoChatIntervalMs : ex?.autoChatIntervalMs),
+    autoChatTimer: null,
     autoEat: opts.autoEat !== undefined ? opts.autoEat : (ex?.autoEat === true),
     eatBusy: false, eatWarnedAt: 0, eatDisposer: null,
     afkTimer: null, afkStepTimers: [],
-    // Antibot state — reset on every fresh connection attempt.
-    verifyTries: 0, verifyLastAt: 0, verifyLastCmd: null,
-    verifySeen: null, mapCaptcha: null,
-    verifyPending: null, verifyLastSeenAt: 0,
     // Cooldown refusals carry across reconnects: the server's timer doesn't
     // reset just because we made a new socket.
     cooldownWaits: ex?.cooldownWaits ?? 0,
@@ -1031,7 +1073,7 @@ async function spawnBot(name, host, port, version, chatId, ownerUsername, opts =
         if (!latest || latest !== info || !latest.autoReconnect) return;
         spawnBot(name, host, port, version, chatId, ownerUsername, {
           loginCmd: info.loginCmd, loginEnabled: info.loginEnabled,
-          ncLogin: info.ncLogin, ncSecond: info.ncSecond, ncEnabled: info.ncEnabled,
+          ncLogin: info.ncLogin, ncSecond: info.ncSecond, ncThird: info.ncThird, ncEnabled: info.ncEnabled,
           afkMode: info.afkMode, afkIntervalMs: info.afkIntervalMs,
           autoEat: info.autoEat,
         });
@@ -1049,7 +1091,7 @@ async function spawnBot(name, host, port, version, chatId, ownerUsername, opts =
       if (!latest || latest !== info || !latest.autoReconnect) return;
       spawnBot(name, host, port, version, chatId, ownerUsername, {
         loginCmd: info.loginCmd, loginEnabled: info.loginEnabled,
-        ncLogin: info.ncLogin, ncSecond: info.ncSecond, ncEnabled: info.ncEnabled,
+        ncLogin: info.ncLogin, ncSecond: info.ncSecond, ncThird: info.ncThird, ncEnabled: info.ncEnabled,
         afkMode: info.afkMode, afkIntervalMs: info.afkIntervalMs,
         autoEat: info.autoEat,
       });
@@ -1064,7 +1106,6 @@ async function spawnBot(name, host, port, version, chatId, ownerUsername, opts =
     stopAfk(info);
     stopLogin(info);
     stopNeocraft(info);
-    stopVerify(info);
     if (info.eatDisposer) { try { info.eatDisposer(); } catch (_) {} info.eatDisposer = null; }
     try { require('./viewer').destroyViewer(info); } catch (_) {}
     info.status = status;
@@ -1081,69 +1122,11 @@ async function spawnBot(name, host, port, version, chatId, ownerUsername, opts =
     scheduleReconnect();
   }
 
-  // --- antibot surfaces -------------------------------------------------
-  // A verification stage can talk to the client on four channels. Chat is handled
-  // in the 'message' listener further down; the other three are wired here.
-
-  // 1. Resource packs. Some antibots require the pack to be accepted before they
-  //    let the player through, and mineflayer never answers on its own — an
-  //    unanswered request is an instant kick on those servers.
+  // 1. Resource packs. Accepting them on join keeps servers that require the
+  //    pack from kicking the player for never answering the request.
   mcBot.on('resourcePack', () => {
     if (mcBots.get(name) !== info) return;
     try { mcBot.acceptResourcePack(); } catch (_) {}
-  });
-
-  // 2. Titles and the action bar — where most antibots print the instruction,
-  //    because a bot that only reads chat never sees it.
-  mcBot.on('title', (text, type) => {
-    if (mcBots.get(name) !== info) return;
-    const clean = readChat(text);
-    if (!clean) return;
-    if (inVerifyWindow(info) || VERIFY_HINT_RE.test(clean)) relayVerify(info, clean, type || 'title');
-  });
-
-  mcBot.on('actionBar', msg => {
-    if (mcBots.get(name) !== info) return;
-    const clean = readChat(msg);
-    if (!clean) return;
-    if (inVerifyWindow(info) || VERIFY_HINT_RE.test(clean)) relayVerify(info, clean, 'action bar');
-  });
-
-  // 3. GUI captchas. Some antibots open a chest and ask the player to click a
-  //    specific item. We can't read the picture, so list what's in the window and
-  //    let the user click a slot with /click.
-  mcBot.on('windowOpen', window => {
-    if (mcBots.get(name) !== info) return;
-    if (!inVerifyWindow(info)) return;
-    try {
-      const title = readChat(window.title) || `window #${window.id}`;
-      const items = (window.slots || [])
-        .map((it, i) => (it ? `${i}: ${it.count}× ${it.name}${it.customName ? ' "' + readChat(it.customName) + '"' : ''}` : null))
-        .filter(Boolean)
-        .slice(0, 40);
-      notify(info.chatId,
-        `📦 <b>${esc(name)}</b> — the server opened a GUI (possible captcha):\n<b>${esc(title)}</b>\n\n` +
-        (items.length ? `<code>${esc(items.join('\n'))}</code>\n\n` : '<i>(empty)</i>\n\n') +
-        `Click a slot with:\n<code>/click ${esc(name)} &lt;slot&gt;</code>`);
-    } catch (_) {}
-  });
-
-  // 4. Map captchas. The code is drawn onto filled maps, so there is no text to
-  //    read — stitch every map the server sent into one picture and let the user
-  //    read it in Telegram.
-  info.mapCaptcha = new MapCaptcha((png, meta) => {
-    if (mcBots.get(name) !== info) return;
-    const which = meta.tiles > 1
-      ? `map captcha (${meta.tiles} maps, ${meta.cols}×${meta.rows})`
-      : `map captcha (map #${meta.id})`;
-    notifyPhoto(
-      info.chatId, png,
-      `🖼️ <b>${esc(name)}</b> — ${which}\n\nRead the code and send it back:\n<code>/cmd ${esc(name)} /verify CODE</code>\nor plain chat: <code>/say CODE</code>`
-    );
-  });
-  mcBot._client?.on('map', packet => {
-    if (mcBots.get(name) !== info) return;
-    info.mapCaptcha?.feed(packet);
   });
 
   mcBot.once('spawn', () => {
@@ -1155,12 +1138,6 @@ async function spawnBot(name, host, port, version, chatId, ownerUsername, opts =
     info.error = null;
     info.loginTries = 0;
     info.loginDone = false;
-    info.verifyTries = 0;
-    info.verifyLastAt = 0;
-    info.verifyLastCmd = null;
-    info.verifySeen = null;
-    info.verifyPending = null;
-    info.verifyLastSeenAt = 0;
     // We got in, so whatever cooldown the server had on us is over.
     info.cooldownWaits = 0;
     info.cooldownUntil = 0;
@@ -1175,8 +1152,9 @@ async function spawnBot(name, host, port, version, chatId, ownerUsername, opts =
     info.eatDisposer = autoEat.attach(info);
 
     const afkNote = info.afkMode !== 'off' ? `\n🏃 Anti-AFK: ${AFK_LABEL[info.afkMode]} every ${humanInterval(info.afkIntervalMs)}` : '';
+    const acNote = info.autoChatMsg && info.autoChatEnabled !== false ? `\n💬 Auto-chat: every ${humanInterval(clampChatInterval(info.autoChatIntervalMs))}` : '';
     const verNote = info.version === AUTO_VERSION && mcBot.version ? `\n🔧 Detected version: <code>${esc(mcBot.version)}</code>` : '';
-    notify(chatId, `🟢 <b>${esc(name)}</b> connected to <code>${esc(host)}:${port}</code>!${verNote}${afkNote}`);
+    notify(chatId, `🟢 <b>${esc(name)}</b> connected to <code>${esc(host)}:${port}</code>!${verNote}${afkNote}${acNote}`);
 
     // Keep probing the outbound path. A bot that has been sitting for hours can
     // have a half-open socket (host asleep, NAT dropped, link died) with no
@@ -1215,7 +1193,6 @@ async function spawnBot(name, host, port, version, chatId, ownerUsername, opts =
         if (Math.random() > 0.5) { // 50% chance
           setTimeout(() => {
             if (!mc || info.status !== 'online') return;
-            if (verifyHold(info)) return; // stay put while a challenge is pending
             mc.setControlState('jump', true);
             setTimeout(() => {
               if (!mc) return;
@@ -1228,7 +1205,6 @@ async function spawnBot(name, host, port, version, chatId, ownerUsername, opts =
         if (Math.random() > 0.6) { // 40% chance
           setTimeout(() => {
             if (!mc || info.status !== 'online') return;
-            if (verifyHold(info)) return;
             mc.setControlState('sneak', true);
             setTimeout(() => {
               if (!mc) return;
@@ -1259,32 +1235,22 @@ async function spawnBot(name, host, port, version, chatId, ownerUsername, opts =
     setTimeout(() => {
       if (mcBots.get(name) !== info || info.status !== 'online') return;
 
-      // A challenge that arrived before we could chat gets answered now.
-      if (info.verifyPending) {
-        const pending = info.verifyPending;
-        info.verifyPending = null;
-        tryAutoVerify(info, pending);
-      }
-
       // Give the server a moment to send its login prompt; if it doesn't, send anyway.
-      if (info.loginCmd && info.loginEnabled !== false) {
-        const armLoginFallback = (delay, deferred) => {
+      // When the Neocraft flow is enabled it already owns the login command — don't
+      // double-send it from the fallback path too.
+      if (info.loginCmd && info.loginEnabled !== false && !(info.ncEnabled && info.ncLogin)) {
+        const armLoginFallback = delay => {
           info.loginTimer = setTimeout(() => {
             info.loginTimer = null;
             if (info.loginDone || info.loginTries) return;
-            // Don't fire /login into an antibot lobby — the challenge has to clear
-            // first, or the auth plugin never sees the command. Wait once, then send.
-            if (!deferred && info.verifyLastAt && Date.now() - info.verifyLastAt < 10000) {
-              armLoginFallback(8000, true);
-              return;
-            }
-            sendLogin(info, deferred ? 'fallback after verification' : 'fallback');
+            sendLogin(info, 'fallback');
           }, delay);
         };
-        armLoginFallback(LOGIN_FALLBACK_MS, false);
+        armLoginFallback(LOGIN_FALLBACK_MS);
       }
 
       scheduleAfk(info);
+      scheduleAutoChat(info);
     }, startDelay);
   });
 
@@ -1315,7 +1281,7 @@ async function spawnBot(name, host, port, version, chatId, ownerUsername, opts =
         }
         // Detect common antibot patterns
         const lowerR = r.toLowerCase();
-        if (VERIFY_HINT_RE.test(lowerR) ||
+        if (/\b(antibot|anti-bot|captcha|verif|human check|not a robot|solve|challenge)\b/i.test(lowerR) ||
             lowerR.includes('compound') || lowerR.includes('denied from entering') ||
             lowerR.includes('bot detected') || lowerR.includes('failed the check') ||
             (lowerR.includes('denied') && !info.wasEverOnline && info.reconnectAttempts === 0)) {
@@ -1386,10 +1352,9 @@ async function spawnBot(name, host, port, version, chatId, ownerUsername, opts =
       prefix = 'kicked (reconnected too fast)';
     } else if (isAntiBot) {
       emoji = '🛡️';
-      prefix = 'AntiBot verification required';
+      prefix = 'rejected by the antibot';
       extraInfo = '\n\n⚠️ <b>The antibot rejected this join.</b>\n' +
-        'It will retry with a longer gap. If the server prints an instruction or shows a map captcha, it gets forwarded here — answer it with <code>/cmd ' + esc(name) + ' /verify CODE</code>.\n' +
-        'If nothing arrives at all, join once with a real client to see what the server asks for.';
+        'It will retry with a longer gap. If the server keeps refusing, join once with a real client from this connection to pass the check yourself.';
     }
     
     markDown('offline', `Kicked: ${r}`, `${emoji} <b>${esc(name)}</b> ${prefix}:\n<code>${esc(r)}</code>${extraInfo}`);
@@ -1442,21 +1407,12 @@ async function spawnBot(name, host, port, version, chatId, ownerUsername, opts =
     const clean = readChat(jsonMsg);
     if (!clean) return;
 
-    // Antibot first: a verification lobby usually blocks /login until it passes,
-    // so answering the challenge has to happen before anything else we send.
-    if (VERIFY_HINT_RE.test(clean) || (inVerifyWindow(info) && findVerifyCommand(clean))) {
-      relayVerify(info, clean, 'chat');
-    }
-
     // Auto-login: react the moment the server asks, and stop retrying once it confirms.
     if (info.loginCmd && info.loginEnabled !== false) {
       if (LOGIN_OK_RE.test(clean)) {
         stopLogin(info);
         info.loginDone = true;
-      } else if (!info.loginDone && LOGIN_PROMPT_RE.test(clean) && !VERIFY_HINT_RE.test(clean)) {
-        // An antibot line can say "authenticate"/"verify" without being the auth
-        // plugin's prompt. Sending /login there wastes an attempt and, on some
-        // setups, counts as a failed check — so let the challenge clear first.
+      } else if (!info.loginDone && LOGIN_PROMPT_RE.test(clean)) {
         sendLogin(info, 'server prompt');
       }
     }
@@ -1484,7 +1440,7 @@ bot.command('start', async ctx => {
 });
 
 const HELP_TEXT = () =>
-  `⭐ <b>Help &amp; Usage</b>\n\n<b>➕ Adding a bot</b>\nPress <i>Add Bot</i> then send:\n<code>name  ip  port  [version]</code>\nUse <code>auto</code> as the version to detect the server's own.\n\n<b>🛡️ AntiBot servers</b>\nOn join the bot accepts the resource pack, and watches chat, titles, the action bar, GUIs and map images for a verification challenge. If the server spells out a command, it's answered automatically; otherwise the challenge is forwarded here so you can answer it:\n<code>/cmd &lt;bot&gt; /verify CODE</code>\n<code>/click &lt;bot&gt; &lt;slot&gt;</code>\n\n<b>Anti-AFK</b> 🏃\nOn a bot's manage screen press <b>Anti-AFK</b>:\n• <b>Jump only</b> — hops in place\n• <b>Walk 1 block</b> — one block forward, one back\n• <b>Jump + Walk</b> — both\nPick any interval from 15s to 30m, or a custom one.\n\n<b>Auto-login</b> 🔐\nPress <b>Set auto-login</b> and send the command your server needs, e.g. <code>/login 1597311</code>. It's saved for that bot and replayed on every reconnect, only when the server asks for it — and never while an antibot challenge is still pending.\n\n<b>Commands</b>\n<code>/bots</code> — list your bots\n<code>/use [name]</code> — pick the bot that runs commands\n<code>/cmd [name] &lt;command&gt;</code> — send a command\n<code>/say &lt;text&gt;</code> — send plain chat\n<code>/click [name] &lt;slot&gt;</code> — click a GUI slot\n<code>/afk [name] &lt;off|jump|walk|both&gt; [interval]</code>\n<code>/setlogin [name] &lt;command&gt;</code>\n<code>/console [name]</code> — open a bot's console\n<code>/forward @you</code> — forward server chat to a group\n\nAnything else starting with <code>/</code> goes straight to the server.`;
+  `⭐ <b>Help &amp; Usage</b>\n\n<b>➕ Adding a bot</b>\nPress <i>Add Bot</i> then send:\n<code>name  ip  port  [version]</code>\nUse <code>auto</code> as the version to detect the server's own.\n\n<b>Anti-AFK</b> 🏃\nOn a bot's manage screen press <b>Anti-AFK</b>:\n• <b>Jump only</b> — hops in place\n• <b>Walk 1 block</b> — one block forward, one back\n• <b>Jump + Walk</b> — both\nPick any interval from 15s to 30m, or a custom one.\n\n<b>Auto-login</b> 🔐\nPress <b>Set auto-login</b> and send the command your server needs, e.g. <code>/login 1597311</code>. It's saved for that bot and replayed on every reconnect, only when the server asks for it.\n\n<b>Commands</b>\n<code>/bots</code> — list your bots\n<code>/use [name]</code> — pick the bot that runs commands\n<code>/cmd [name] &lt;command&gt;</code> — send a command\n<code>/say &lt;text&gt;</code> — send plain chat\n<code>/click [name] &lt;slot&gt;</code> — click a GUI slot\n<code>/afk [name] &lt;off|jump|walk|both&gt; [interval]</code>\n<code>/setlogin [name] &lt;command&gt;</code>\n<code>/console [name]</code> — open a bot's console\n<code>/forward @you</code> — forward server chat to a group\n\nAnything else starting with <code>/</code> goes straight to the server.`;
 
 bot.command('help', async ctx => {
   await ctx.reply(HELP_TEXT(), {
@@ -1495,6 +1451,37 @@ bot.command('help', async ctx => {
 
 bot.command('bots', async ctx => {
   await ctx.reply(botListText(ctx), { parse_mode: 'HTML', reply_markup: botListKeyboard(ctx) });
+});
+
+// "Where is the bot?" — position, world, health and uptime at a glance. Useful
+// exactly when a screenshot can't be rendered or the bot seems to have vanished.
+bot.command('where', async ctx => {
+  const parts = ctx.message.text.trim().split(/\s+/).slice(1);
+  const { info, error, keyboard } = takeBotArg(ctx, parts);
+  if (!info) return ctx.reply(error || 'No bot found.', { parse_mode: 'HTML', reply_markup: keyboard });
+  if (!canControl(ctx, info)) return ctx.reply(`❌ <b>${esc(info.name)}</b> isn't yours to control.`, { parse_mode: 'HTML' });
+
+  if (info.status !== 'online' || !info.mcBot) {
+    return ctx.reply(`📍 <b>${esc(info.name)}</b> is <b>${info.status}</b> — last known state:\n<code>${esc(info.error || 'none')}</code>`, { parse_mode: 'HTML' });
+  }
+
+  const b = info.mcBot;
+  const p = b.entity?.position;
+  if (!p) return ctx.reply(`📍 <b>${esc(info.name)}</b> is online but its position isn't known yet.`, { parse_mode: 'HTML' });
+
+  const dim = b.game?.dimension ? esc(b.game.dimension) : '?';
+  const held = b.heldItem ? `${b.heldItem.count > 1 ? `${b.heldItem.count}x ` : ''}${esc(b.heldItem.displayName || b.heldItem.name)}` : 'empty hand';
+  const ut = info.connectedAt ? uptime(Date.now() - info.connectedAt) : '?';
+  await ctx.reply(
+    `📍 <b>${esc(info.name)}</b> — here's where it stands\n\n` +
+    `<b>XYZ:</b> <code>${p.x.toFixed(1)}, ${p.y.toFixed(1)}, ${p.z.toFixed(1)}</code>\n` +
+    `<b>World:</b> ${dim}\n` +
+    `<b>Health:</b> ${Math.round(b.health ?? 0)}/20 · <b>Food:</b> ${Math.round(b.food ?? 0)}/20\n` +
+    `<b>Holding:</b> ${held}\n` +
+    `<b>Online for:</b> ${ut}\n\n` +
+    `Server: <code>${esc(info.host)}:${info.port}</code>`,
+    { parse_mode: 'HTML', reply_markup: new InlineKeyboard().text('📸 Screenshot', `shot:${info.name}`).text('⚙️ Manage', `manage:${info.name}`).row().text('⌨️ Console', `console:${info.name}`) }
+  );
 });
 
 bot.command('console', async ctx => {
@@ -1614,7 +1601,8 @@ function applyNcCmd(info, which, cmd) {
   if (clean.length > MC_MAX_LEN) return { error: `❌ Too long — max ${MC_MAX_LEN} characters.` };
   if (/[\r\n]/.test(clean)) return { error: '❌ One line only.' };
   if (which === 'login') info.ncLogin = clean;
-  else info.ncSecond = clean;
+  else if (which === 'second') info.ncSecond = clean;
+  else info.ncThird = clean;
   saveData();
   return { ok: true };
 }
@@ -1787,7 +1775,7 @@ bot.on('callback_query:data', async ctx => {
   const rest = data.slice(sep + 1);
   // afkmode:Name:jump and afkint:Name:30000 carry a trailing argument.
   let name = rest, arg = null;
-  if (action === 'afkmode' || action === 'afkint' || action === 'slot') {
+  if (action === 'afkmode' || action === 'afkint' || action === 'acint' || action === 'slot') {
     const i = rest.lastIndexOf(':');
     if (i !== -1) { name = rest.slice(0, i); arg = rest.slice(i + 1); }
   }
@@ -1835,9 +1823,13 @@ bot.on('callback_query:data', async ctx => {
       try {
         const viewer = require('./viewer');
         const shots = await viewer.takeFourScreenshots(info);
-        const caption = `<b>${esc(name)}</b> — 4 directions from where it stands\n` +
+        const b = info.mcBot;
+        const p = b?.entity?.position;
+        const where = p
+          ? `\n📍 XYZ: <b>${p.x.toFixed(1)}, ${p.y.toFixed(1)}, ${p.z.toFixed(1)}</b>${b.game?.dimension ? ` · ${esc(b.game.dimension)}` : ''}`
+          : '';
+        const caption = `<b>${esc(name)}</b> — 4 directions from where it stands${where}\n` +
           shots.map((s, i) => `${i + 1}. ${s.label}`).join(' · ');
-        // Album: one message, four photos. Caption lives on the first item.
         const media = shots.map((s, i) => ({
           type: 'photo',
           media: new InputFile(s.buffer, `shot-${i + 1}.jpg`),
@@ -1897,6 +1889,14 @@ bot.on('callback_query:data', async ctx => {
       );
       return answer('✏️ Send the 2nd command');
 
+    case 'ncsetthird':
+      setState(chatId, { action: 'awaiting_nc_third', name });
+      await edit(
+        `🏰 <b>Neocraft — set 3rd command</b>\n\nSend the command to run 5 minutes after the 2nd, e.g.\n<code>/kit daily</code>`,
+        new InlineKeyboard().text('❌ Cancel', `neocraft:${name}`)
+      );
+      return answer('✏️ Send the 3rd command');
+
     case 'nctoggle':
       info.ncEnabled = info.ncEnabled === true ? false : true;
       if (info.ncEnabled && info.status === 'online' && info.mcBot) scheduleNeocraft(info);
@@ -1908,11 +1908,20 @@ bot.on('callback_query:data', async ctx => {
     case 'ncclear':
       info.ncLogin = null;
       info.ncSecond = null;
+      info.ncThird = null;
       info.ncEnabled = false;
       stopNeocraft(info);
       saveData();
       await edit(neocraftMenuText(info), neocraftMenuKeyboard(name));
       return answer('🗑️ Neocraft settings cleared');
+
+    case 'ncskipthird':
+      chatStates.delete(chatId);
+      info.ncEnabled = true;
+      if (info.status === 'online' && info.mcBot) scheduleNeocraft(info);
+      saveData();
+      await edit(neocraftMenuText(info), neocraftMenuKeyboard(name));
+      return answer('✅ Flow enabled without a 3rd command');
 
     case 'reconnect': {
       if (info.status === 'online' || info.status === 'connecting') return answer('Already ' + info.status);
@@ -1924,7 +1933,7 @@ bot.on('callback_query:data', async ctx => {
       
       spawnBot(name, info.host, info.port, info.version, info.chatId, info.ownerUsername, {
         loginCmd: info.loginCmd, loginEnabled: info.loginEnabled,
-        ncLogin: info.ncLogin, ncSecond: info.ncSecond, ncEnabled: info.ncEnabled,
+        ncLogin: info.ncLogin, ncSecond: info.ncSecond, ncThird: info.ncThird, ncEnabled: info.ncEnabled,
         afkMode: info.afkMode, afkIntervalMs: info.afkIntervalMs,
         autoEat: info.autoEat,
       });
@@ -1990,6 +1999,61 @@ bot.on('callback_query:data', async ctx => {
       if (!info.afkMode || info.afkMode === 'off') return answer('Pick a mode first');
       afkPulse(info);
       return answer(`▶️ ${AFK_LABEL[info.afkMode]} sent`);
+
+    // --- auto-chat ---
+    case 'ac':
+      chatStates.delete(chatId);
+      await edit(acMenuText(info), acMenuKeyboard(name));
+      return answer();
+
+    case 'acmsg':
+      setState(chatId, { action: 'awaiting_autochat_msg', name });
+      await edit(
+        `💬 <b>Auto-chat message — ${esc(name)}</b>\n\nSend the message the bot should repeat in server chat.\nStart it with <code>/</code> and it runs as a command instead.\n\nMax ${MC_MAX_LEN} characters, one line.`,
+        new InlineKeyboard().text('❌ Cancel', `ac:${name}`)
+      );
+      return answer('✏️ Type the message in chat');
+
+    case 'acint': {
+      info.autoChatIntervalMs = clampChatInterval(Number(arg));
+      info.autoChatEnabled = true;
+      stopAutoChat(info);
+      if (info.autoChatMsg && info.status === 'online') scheduleAutoChat(info);
+      saveData();
+      await edit(acMenuText(info), acMenuKeyboard(name));
+      return answer(`⏱ Every ${humanInterval(info.autoChatIntervalMs)}`);
+    }
+
+    case 'accustom':
+      setState(chatId, { action: 'awaiting_autochat_interval', name });
+      await edit(
+        `✏️ <b>Custom interval — ${esc(name)}</b>\n\nSend how often the message should be sent:\n<code>10m</code>  <code>30m</code>  <code>2h</code>  <code>1h30m</code>\n\nA bare number means minutes. Allowed: 1m – 24h.`,
+        new InlineKeyboard().text('❌ Cancel', `ac:${name}`)
+      );
+      return answer('✏️ Type the interval in chat');
+
+    case 'actoggle': {
+      info.autoChatEnabled = !(info.autoChatEnabled !== false);
+      stopAutoChat(info);
+      if (info.autoChatEnabled && info.autoChatMsg && info.status === 'online') scheduleAutoChat(info);
+      saveData();
+      await edit(acMenuText(info), acMenuKeyboard(name));
+      return answer(info.autoChatEnabled ? '▶️ Auto-chat resumed' : '⏸ Auto-chat paused');
+    }
+
+    case 'acnow':
+      if (info.status !== 'online' || !info.mcBot) return answer('Bot is not online');
+      if (!info.autoChatMsg) return answer('Set a message first');
+      queueSend(info, info.autoChatMsg);
+      return answer('💬 Message queued');
+
+    case 'acclear':
+      info.autoChatMsg = null;
+      info.autoChatEnabled = true;
+      stopAutoChat(info);
+      saveData();
+      await edit(acMenuText(info), acMenuKeyboard(name));
+      return answer('🗑 Auto-chat message cleared');
 
     // --- auto-login ---
     case 'login':
@@ -2088,10 +2152,29 @@ bot.on('message:text', async ctx => {
       return ctx.reply(res.error, { parse_mode: 'HTML', reply_markup: new InlineKeyboard().text('❌ Cancel', `neocraft:${info.name}`) });
     }
     chatStates.delete(chatId);
+    setState(chatId, { action: 'awaiting_nc_third', name: info.name });
+    return ctx.reply(`▶️ 2nd command saved for <b>${esc(info.name)}</b>:\n<code>${esc(info.ncSecond)}</code>\n\nNow send the <b>3rd command</b> — it runs <b>5 minutes</b> after the 2nd, e.g.\n<code>/kit daily</code>\n\nOr skip it:`, {
+      parse_mode: 'HTML',
+      reply_markup: new InlineKeyboard().text('⏭ Skip 3rd command', `ncskipthird:${info.name}`),
+    });
+  }
+
+  // --- Neocraft: set 3rd command (runs 5 minutes after the 2nd) ---
+  if (state?.action === 'awaiting_nc_third') {
+    const info = mcBots.get(state.name);
+    if (!info || !canControl(ctx, info)) {
+      chatStates.delete(chatId);
+      return ctx.reply(`⚠️ That bot is gone.`, { reply_markup: new InlineKeyboard().text('📋 Bots', 'list_bots') });
+    }
+    const res = applyNcCmd(info, 'third', text);
+    if (res.error) {
+      return ctx.reply(res.error, { parse_mode: 'HTML', reply_markup: new InlineKeyboard().text('❌ Cancel', `neocraft:${info.name}`) });
+    }
+    chatStates.delete(chatId);
     info.ncEnabled = true;
     if (info.status === 'online' && info.mcBot) scheduleNeocraft(info);
     saveData();
-    return ctx.reply(`▶️ 2nd command saved for <b>${esc(info.name)}</b>:\n<code>${esc(info.ncSecond)}</code>\n\nNeocraft flow is ready and enabled.`, {
+    return ctx.reply(`⏱ 3rd command saved for <b>${esc(info.name)}</b>:\n<code>${esc(info.ncThird)}</code>\n\nIt will run 5 minutes after the 2nd command.\nNeocraft flow is ready and enabled.`, {
       parse_mode: 'HTML',
       reply_markup: new InlineKeyboard().text('🏰 Neocraft', `neocraft:${info.name}`),
     });
@@ -2137,6 +2220,62 @@ bot.on('message:text', async ctx => {
     return ctx.reply(`🔐 Saved for <b>${esc(info.name)}</b>: <code>${esc(maskLogin(info.loginCmd))}</code>\n\nIt will be sent automatically whenever this bot joins and the server asks for a login.\n\n⚠️ <i>Delete your last message — it contains the password.</i>`, {
       parse_mode: 'HTML',
       reply_markup: kb,
+    });
+  }
+
+  // --- auto-chat message ---
+  if (state?.action === 'awaiting_autochat_msg') {
+    const info = mcBots.get(state.name);
+    if (!info || !canControl(ctx, info)) {
+      chatStates.delete(chatId);
+      return ctx.reply(`⚠️ That bot is gone.`, { reply_markup: new InlineKeyboard().text('📋 Bots', 'list_bots') });
+    }
+    const clean = text.trim().replace(/\s+/g, ' ');
+    if (!clean) {
+      return ctx.reply('⚠️ Empty message — send the text the bot should repeat.', {
+        reply_markup: new InlineKeyboard().text('❌ Cancel', `ac:${info.name}`),
+      });
+    }
+    if (clean.length > MC_MAX_LEN) {
+      return ctx.reply(`❌ Too long — Minecraft caps messages at ${MC_MAX_LEN} characters. Send a shorter one.`, {
+        reply_markup: new InlineKeyboard().text('❌ Cancel', `ac:${info.name}`),
+      });
+    }
+    chatStates.delete(chatId);
+    info.autoChatMsg = clean;
+    info.autoChatEnabled = true;
+    stopAutoChat(info);
+    if (info.status === 'online') scheduleAutoChat(info);
+    saveData();
+    return ctx.reply(`💬 Saved for <b>${esc(info.name)}</b>:\n<code>${esc(clean)}</code>\n\nIt will be sent every <b>${humanInterval(clampChatInterval(info.autoChatIntervalMs))}</b> while the bot is online.`, {
+      parse_mode: 'HTML',
+      reply_markup: new InlineKeyboard().text('💬 Auto-chat', `ac:${info.name}`).text('⚙️ Manage', `manage:${info.name}`),
+    });
+  }
+
+  // --- auto-chat custom interval ---
+  if (state?.action === 'awaiting_autochat_interval') {
+    const info = mcBots.get(state.name);
+    if (!info || !canControl(ctx, info)) {
+      chatStates.delete(chatId);
+      return ctx.reply(`⚠️ That bot is gone.`, { reply_markup: new InlineKeyboard().text('📋 Bots', 'list_bots') });
+    }
+    const ms = parseChatInterval(text);
+    if (ms === null) {
+      return ctx.reply(`❌ Didn't understand that. Try <code>10m</code>, <code>2h</code> or <code>1h30m</code> (1m – 24h).`, {
+        parse_mode: 'HTML',
+        reply_markup: new InlineKeyboard().text('❌ Cancel', `ac:${info.name}`),
+      });
+    }
+    chatStates.delete(chatId);
+    info.autoChatIntervalMs = ms;
+    info.autoChatEnabled = true;
+    stopAutoChat(info);
+    if (info.autoChatMsg && info.status === 'online') scheduleAutoChat(info);
+    saveData();
+    return ctx.reply(`⏱ <b>${esc(info.name)}</b> — auto-chat every <b>${humanInterval(ms)}</b>.`, {
+      parse_mode: 'HTML',
+      reply_markup: new InlineKeyboard().text('💬 Auto-chat', `ac:${info.name}`).text('⚙️ Manage', `manage:${info.name}`),
     });
   }
 
@@ -2207,9 +2346,13 @@ bot.on('message:text', async ctx => {
     loginEnabled: existing?.loginEnabled !== false,
     ncLogin: existing?.ncLogin ?? null,
     ncSecond: existing?.ncSecond ?? null,
+    ncThird: existing?.ncThird ?? null,
     ncEnabled: existing?.ncEnabled === true,
     afkMode: existing?.afkMode ?? 'off',
     afkIntervalMs: existing?.afkIntervalMs ?? DEFAULT_AFK_INTERVAL_MS,
+    autoChatMsg: existing?.autoChatMsg ?? null,
+    autoChatEnabled: existing?.autoChatEnabled !== false,
+    autoChatIntervalMs: existing?.autoChatIntervalMs ?? DEFAULT_AUTOCHAT_INTERVAL_MS,
     autoEat: existing?.autoEat === true,
   });
   activeBot.set(chatId, name);
@@ -2250,8 +2393,8 @@ function shutdown(signal) {
     // Keep autoReconnect as-is so bots come back up on the next start.
     if (info.reconnectTimer) clearTimeout(info.reconnectTimer);
     stopAfk(info);
+    stopAutoChat(info);
     stopLogin(info);
-    stopVerify(info);
     if (info.eatDisposer) { try { info.eatDisposer(); } catch (_) {} info.eatDisposer = null; }
     try { require('./viewer').destroyViewer(info); } catch (_) {}
     if (info.sendTimer) clearTimeout(info.sendTimer);
@@ -2266,6 +2409,59 @@ process.once('SIGTERM', () => shutdown('SIGTERM'));
 
 console.log('🚀 Minecraft Bot Manager starting…');
 loadData();
+
+// The web panel shares the same in-memory bot registry as Telegram. It is
+// intentionally dependency-free so it works on Railway and small VPS hosts.
+const WEB_PORT = Number(process.env.WEB_PORT || process.env.PORT || 3000);
+const WEB_TOKEN = process.env.WEB_TOKEN || process.env.WEB_API_TOKEN || '';
+const web = startWeb({
+  port: WEB_PORT,
+  token: WEB_TOKEN,
+  get: name => mcBots.get(name),
+  list: () => [...mcBots.values()],
+  connect: async ({ name, host, port, version }) => {
+    const existing = mcBots.get(name);
+    if (existing && (existing.status === 'online' || existing.status === 'connecting')) throw new Error(`${name} is already ${existing.status}`);
+    spawnBot(name, host, port, version || AUTO_VERSION, 0, 'web', {
+      loginCmd: existing?.loginCmd ?? null, loginEnabled: existing?.loginEnabled !== false,
+      ncLogin: existing?.ncLogin ?? null, ncSecond: existing?.ncSecond ?? null, ncThird: existing?.ncThird ?? null, ncEnabled: existing?.ncEnabled === true,
+      afkMode: existing?.afkMode ?? 'off', afkIntervalMs: existing?.afkIntervalMs ?? DEFAULT_AFK_INTERVAL_MS,
+      autoChatMsg: existing?.autoChatMsg ?? null, autoChatEnabled: existing?.autoChatEnabled !== false,
+      autoChatIntervalMs: existing?.autoChatIntervalMs ?? DEFAULT_AUTOCHAT_INTERVAL_MS, autoEat: existing?.autoEat === true,
+    });
+    saveData();
+  },
+  screenshot: info => require('./viewer').takeFourScreenshots(info).then(shots => shots[0].buffer),
+  action: async (info, body) => {
+    const action = String(body.action || '');
+    if (action === 'reconnect') {
+      if (info.status === 'online' || info.status === 'connecting') throw new Error('Bot is already connected');
+      info.cooldownUntil = 0; info.cooldownWaits = 0; info.autoReconnect = true;
+      return web.connect({ name: info.name, host: info.host, port: info.port, version: info.version });
+    }
+    if (action === 'disconnect') { info.autoReconnect = false; destroyBot(info); info.status = 'offline'; info.error = 'Disconnected by user'; saveData(); return; }
+    if (action === 'remove') { info.autoReconnect = false; destroyBot(info); mcBots.delete(info.name); saveData(); return; }
+    if (info.status !== 'online' || !info.mcBot) throw new Error('Bot is not online');
+    const mc = info.mcBot;
+    if (action === 'chat') {
+      const text = String(body.text || '').trim();
+      if (!text || text.length > MC_MAX_LEN) throw new Error(`Chat must be 1-${MC_MAX_LEN} characters`);
+      queueSend(info, text); return;
+    }
+    if (action === 'control') {
+      const allowed = new Set(['forward', 'back', 'left', 'right', 'jump', 'sneak', 'sprint', 'use']);
+      if (!allowed.has(body.control)) throw new Error('Unknown control');
+      mc.setControlState(body.control, body.state !== false); return;
+    }
+    if (action === 'stopControls') { for (const c of ['forward','back','left','right','jump','sneak','sprint','use']) mc.setControlState(c, false); return; }
+    if (action === 'look') { const yaw = Number(body.yaw), pitch = Number(body.pitch); if (!Number.isFinite(yaw) || !Number.isFinite(pitch)) throw new Error('Invalid yaw/pitch'); await mc.look(yaw, Math.max(-Math.PI / 2, Math.min(Math.PI / 2, pitch)), true); return; }
+    if (action === 'slot') { const slot = Number(body.slot); if (!Number.isInteger(slot) || slot < 0 || slot > 8) throw new Error('Invalid hotbar slot'); mc.setQuickBarSlot(slot); return; }
+    if (action === 'afk') { setAfk(info, body.mode, body.intervalMs); return; }
+    if (action === 'autoeat') { info.autoEat = body.enabled !== false; saveData(); return; }
+    if (action === 'login') { const result = applyLoginCmd(info, String(body.command || '')); if (result.error) throw new Error(result.error); return; }
+    throw new Error('Unknown action');
+  },
+});
 if (mcBots.size) {
   const off = [...mcBots.values()].filter(b => !b.autoReconnect).length;
   console.log(`↩️  Restored ${mcBots.size} bot(s)${off ? ` (${off} left disconnected)` : ''}`);
@@ -2274,6 +2470,7 @@ if (mcBots.size) {
 bot.api.setMyCommands([
   { command: 'start', description: 'Open the main menu' },
   { command: 'bots', description: 'List your bots' },
+  { command: 'where', description: "Show where a bot is (XYZ, world, health)" },
   { command: 'use', description: 'Pick which bot runs your commands' },
   { command: 'cmd', description: 'Send a command to the server' },
   { command: 'say', description: 'Send plain chat as the bot' },

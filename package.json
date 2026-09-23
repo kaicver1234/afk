@@ -1,11 +1,12 @@
 {
   "name": "telegram-mc-bot",
   "version": "1.1.0",
-  "description": "Telegram bot to connect fake players to Minecraft servers, with anti-AFK and saved auto-login",
+  "description": "Mineflayer Minecraft bots with Telegram and authenticated web control",
   "main": "index.js",
   "license": "MIT",
   "scripts": {
     "start": "node index.js",
+    "web": "node index.js",
     "bun-start": "bun index.js",
     "test": "node test/smoke.js && node test/restart.js && node test/afk-timer.js && node test/shutdown.js"
   },

@@ -113,13 +113,9 @@ if (Test-Path $envFile) {
 
 if (-not $tokenOk) {
     if (-not (Test-Path $envFile)) {
-        # Create a fresh .env with the same defaults the project ships with.
+        # Create a fresh .env — only the token is needed; the bot reads everything else from the UI.
         @(
             'TELEGRAM_BOT_TOKEN='
-            'USE_PROXY=true'
-            'PROXY_FILE=proxies.txt'
-            'PROXY_MODE=round-robin'
-            'PROXY_DEFAULT_TYPE=socks5'
         ) | Set-Content $envFile -Encoding utf8
     }
     Write-Warn "TELEGRAM_BOT_TOKEN is missing."
