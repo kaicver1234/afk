@@ -2453,7 +2453,10 @@ const web = startWeb({
       if (!allowed.has(body.control)) throw new Error('Unknown control');
       mc.setControlState(body.control, body.state !== false); return;
     }
-    if (action === 'stopControls') { for (const c of ['forward','back','left','right','jump','sneak','sprint','use']) mc.setControlState(c, false); return; }
+    if (action === 'stopControls') { for (const c of ['forward','back','left','right','jump','sneak','sprint','use']) mc.setControlState(c, false); try { mc.deactivateItem(); } catch (_) {} return; }
+    if (action === 'attack') { mc.attack(); return; }
+    if (action === 'useItem') { mc.activateItem(); return; }
+    if (action === 'drop') { mc.tossStack(mc.heldItem); return; }
     if (action === 'look') { const yaw = Number(body.yaw), pitch = Number(body.pitch); if (!Number.isFinite(yaw) || !Number.isFinite(pitch)) throw new Error('Invalid yaw/pitch'); await mc.look(yaw, Math.max(-Math.PI / 2, Math.min(Math.PI / 2, pitch)), true); return; }
     if (action === 'slot') { const slot = Number(body.slot); if (!Number.isInteger(slot) || slot < 0 || slot > 8) throw new Error('Invalid hotbar slot'); mc.setQuickBarSlot(slot); return; }
     if (action === 'afk') { setAfk(info, body.mode, body.intervalMs); return; }

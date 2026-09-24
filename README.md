@@ -52,6 +52,7 @@ Minecraft chat appears in your Telegram group:
 - **Chat forwarding** — pipe Minecraft server chat to Telegram group chats in real time, batched so busy servers don't hit Telegram's rate limit
 - **Inline keyboard UI** — everything controlled through Telegram buttons; no slash commands needed in private chat
 - **Authenticated web control panel** 🌐 — open `/` on `WEB_PORT`, enter `WEB_TOKEN`, and control every bot from a browser
+- **Embedded 3D Minecraft viewer** 🎮 — open the game view inside the dashboard, watch the live bot world, and use keyboard/buttons for movement, jump, sneak, sprint, attack and item use
 - **REST API** — `/api/bots` exposes status and controlled actions for custom frontends or automation
 - **Detailed status** — uptime, server address, version, anti-AFK mode, login state, last error per bot
 - **Survives restarts** — bots, anti-AFK settings and login commands are saved to disk; disconnected bots come back as disconnected, not silently forgotten
@@ -140,8 +141,8 @@ Available web controls include:
 
 - add/remove/reconnect/disconnect bots
 - live connection, coordinates, dimension, health, hunger and uptime
-- chat/commands, movement buttons, jump/sneak/sprint, stop, and look direction
-- hotbar slot, inventory, screenshot, anti-AFK, auto-eat and saved login actions via REST
+- chat/commands, held movement controls, keyboard W/A/S/D/Space/Shift, jump/sneak/sprint, stop, attack, item use and look direction
+- embedded prismarine-viewer 3D world, hotbar slot, inventory, screenshot, anti-AFK, auto-eat and saved login actions via REST
 
 ### Option B: Deploy to Railway 🚂
 
