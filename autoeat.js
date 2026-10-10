@@ -1,13 +1,15 @@
 'use strict';
 
-// Auto-eat: keeps the fake player from starving. When the food bar drops below
-// a threshold, equip the best food in the inventory, consume it, and put the
-// previous item back in hand. Runs entirely through mineflayer's own inventory
-// API, so it behaves like a player clicking through their hotbar.
+// Auto-eat: heals the fake player by eating the moment its health drops below
+// full. Eating restores hunger and the saturation that follows regenerates
+// hearts — so whenever the player is hurt and can still eat, it eats. Runs
+// entirely through mineflayer's own inventory API, so it behaves like a player
+// clicking through their hotbar.
 //
 // Toggle per bot via info.autoEat (true/false); armed from index.js on spawn.
 
-const EAT_AT_FOOD = 14;        // start eating at 7 drumsticks (of 10)
+const HEALTH_FULL = 20;      // eat the moment health isn't full anymore
+const FOOD_FULL = 20;        // at full hunger you can't eat (natural regen already runs)
 const EAT_COOLDOWN_MS = 1500;  // spacing between attempts; a failed eat retries here
 
 // Foods that hurt more than they help unless we're desperate.
@@ -44,19 +46,27 @@ function pickFood(info) {
   return bestNormal || bestDesperate;
 }
 
+// True when the player is hurt and eating would help: health below full, and
+// the hunger bar still has room (at 20/20 the game won't let you eat, and
+// natural regeneration is already running).
+function shouldEat(mc) {
+  if (mc.health == null || mc.food == null) return false;
+  return mc.health < HEALTH_FULL && mc.food < FOOD_FULL;
+}
+
 async function tryEat(info, why) {
   const mc = info.mcBot;
   if (!info.autoEat) return false;
   if (!mc || info.status !== 'online') return false;
   if (info.eatBusy) return false;
-  if (mc.food == null || mc.food > EAT_AT_FOOD) return false;
+  if (!shouldEat(mc)) return false;
 
   const food = pickFood(info);
   if (!food) {
-    // Only nag once per hungry spell, not every health tick.
+    // Only nag once per hurt spell, not every health tick.
     if (!info.eatWarnedAt || Date.now() - info.eatWarnedAt > 60000) {
-      info.eatWarnedAt = Date.now();
-      info.error = `Hungry — no food in inventory`;
+      info.eatWarnedAt = Date.now;
+      info.error = `Hurt — no food in inventory`;
     }
     return false;
   }
@@ -91,7 +101,7 @@ function attach(info) {
 
   function tick() {
     if (stopped) return;
-    tryEat(info, 'food was low').catch(() => {}).finally(() => {
+    tryEat(info, 'health was low').catch(() => {}).finally(() => {
       if (!stopped && info.status === 'online') armCooldown(EAT_COOLDOWN_MS);
     });
   }
@@ -108,11 +118,15 @@ function attach(info) {
     if (stopped || !info.autoEat) return;
     if (info.mcBot == null) return;
     if (info.eatBusy) return;
-    if (info.mcBot.food != null && info.mcBot.food <= EAT_AT_FOOD) tick();
+    if (shouldEat(info.mcBot)) tick();
   };
 
-  info.mcBot.on('health', onHealth);
-  // Also check once shortly after spawn — food may already be low on rejoin.
+  // Pin the connection this loop watches: the disposer must be able to detach
+  // from it even if info.mcBot has already been cleared by teardown.
+  const bot = info.mcBot;
+  if (!bot) return () => {};
+  bot.on('health', onHealth);
+  // Also check once shortly after spawn — health may already be low on rejoin.
   kickstart = setTimeout(onHealth, 3000);
   if (kickstart.unref) kickstart.unref();
 
@@ -120,7 +134,10 @@ function attach(info) {
     stopped = true;
     clearTimeout(timer);
     clearTimeout(kickstart);
+    // Detach the health hook — the manager no longer wipes every bot listener
+    // on teardown, so this loop has to clean up after itself.
+    try { bot.off('health', onHealth); } catch (_) {}
   };
 }
 
-module.exports = { attach, tryEat, pickFood, EAT_AT_FOOD };
+module.exports = { attach, tryEat, pickFood, shouldEat, HEALTH_FULL };

@@ -15,7 +15,7 @@
 
 ## 🤖 McAfk — Mineflayer Bot Manager
 
-A Node.js Mineflayer manager that connects offline-mode players to Minecraft servers and lets you operate them from Telegram **or an authenticated web dashboard**. The web panel provides live status, position/health/food, chat, movement controls, camera look, hotbar/inventory, reconnect/disconnect, screenshots and bot lifecycle management.
+A Node.js Mineflayer manager that connects offline-mode players to Minecraft servers and lets you operate them entirely from Telegram — live status, position/health/food, server chat forwarding and full bot lifecycle management from your chat.
 
 Mineflayer is the underlying high-level Minecraft client; this project is an operations layer around its bot, world, physics, inventory and chat APIs.
 
@@ -44,16 +44,13 @@ Minecraft chat appears in your Telegram group:
 
 - **Connect fake players** to any Minecraft server that is cracked and have via backwards (offline/cracked auth)
 - **Multi-bot management** — add, disconnect, reconnect, and remove bots at any time
-- **Anti-AFK** 🏃 — jump in place, step one block forward and back, or both, on any interval from 15 s to 30 m. Toggled per bot from Telegram.
+- **Anti-AFK** 🏃 — jump in place, step one block forward and back, or both, on any interval from 5 s to 30 m. Toggled per bot from Telegram.
 - **Saved auto-login** 🔐 — store your `/login <password>` per bot; it's replayed automatically on every reconnect, but only when the server actually asks for it
 - **Run server commands from Telegram** — type `/tpa Player123` in Telegram and your bot runs it in-game
 - **ViaVersion / ViaBackwards / ViaRewind support** — connect with any client version to any server version
-- **Auto-reconnect** with exponential backoff (5 s → 10 s → 20 s → 40 s → 60 s)
+- **Auto-reconnect** — retries about every 4 s until the bot is back in; antibot cooldowns are honored (the bot waits out the window the server asked for instead of retrying)
 - **Chat forwarding** — pipe Minecraft server chat to Telegram group chats in real time, batched so busy servers don't hit Telegram's rate limit
 - **Inline keyboard UI** — everything controlled through Telegram buttons; no slash commands needed in private chat
-- **Authenticated web control panel** 🌐 — open `/` on `WEB_PORT`, enter `WEB_TOKEN`, and control every bot from a browser
-- **Embedded 3D Minecraft viewer** 🎮 — open the game view inside the dashboard, watch the live bot world, and use keyboard/buttons for movement, jump, sneak, sprint, attack and item use
-- **REST API** — `/api/bots` exposes status and controlled actions for custom frontends or automation
 - **Detailed status** — uptime, server address, version, anti-AFK mode, login state, last error per bot
 - **Survives restarts** — bots, anti-AFK settings and login commands are saved to disk; disconnected bots come back as disconnected, not silently forgotten
 
@@ -124,25 +121,6 @@ You should see:
 ```
 
 ---
-
-### Web dashboard
-
-The same process serves a Persian RTL dashboard by default on port `3000` (or Railway's `PORT`). Set a strong token before starting:
-
-```bash
-WEB_PORT=3000
-WEB_TOKEN=replace-with-a-long-random-secret
-npm start
-```
-
-Then open `http://localhost:3000/` and enter `WEB_TOKEN`. The API requires `Authorization: Bearer <WEB_TOKEN>` on every `/api/*` request. Keep the panel behind HTTPS/VPN/reverse-proxy authentication when exposing it to the public internet; never leave it on an untrusted network without a strong token.
-
-Available web controls include:
-
-- add/remove/reconnect/disconnect bots
-- live connection, coordinates, dimension, health, hunger and uptime
-- chat/commands, held movement controls, keyboard W/A/S/D/Space/Shift, jump/sneak/sprint, stop, attack, item use and look direction
-- embedded prismarine-viewer 3D world, hotbar slot, inventory, screenshot, anti-AFK, auto-eat and saved login actions via REST
 
 ### Option B: Deploy to Railway 🚂
 
@@ -385,7 +363,7 @@ On a bot's manage screen press **🎒 Hotbar** to see its 9 hotbar slots and whi
 item is in each one. Tap a slot number to make the bot hold that item — handy
 for switching between a pickaxe, axe, sword, food, and so on from Telegram.
 
-The selected slot is marked with a ✅. The bot must be online for the change to
+The selected slot is marked with `[*]`. The bot must be online for the change to
 apply.
 
 ### Neocraft server flow 🏰
@@ -399,10 +377,9 @@ It asks for two commands:
 1. **Login command** — e.g. `/login 1597311`
 2. **2nd command** — e.g. `/survival` (to enter the survival section)
 
-Timing: the login command is sent ~2s after joining — or right after an antibot
-challenge clears, so it isn't swallowed by a verification lobby — and the 2nd
-command ~5–6s after that. Settings are saved and replayed automatically on every
-reconnect.
+Timing: the login command is sent ~2s after joining, the 2nd command 10s after
+that, and the optional 3rd command 5 minutes after the 2nd. Settings are saved
+and replayed automatically on every reconnect.
 
 ### Running server commands from Telegram
 
@@ -464,6 +441,7 @@ The bot sends it to the server and mirrors the server's reply back to you for 20
 | `/afk [name] <off\|jump\|walk\|both> [interval]` | Configure anti-AFK |
 | `/setlogin [name] <command>` | Save the auto-login command |
 | `/console [name]` | Open a bot's console |
+| `/players [name]` | List everyone online on the server |
 | *anything else starting with `/`* | Relayed straight to the server |
 
 > Only the chat that added a bot, or the Telegram user who owns it, can see or send it commands.
@@ -497,21 +475,16 @@ Lines are collected for a couple of seconds and sent as one Telegram message, so
 
 ## Auto-Reconnect
 
-When a bot loses connection for any reason (kick, timeout, server restart), it automatically retries:
+When a bot loses connection for any reason (kick, timeout, server restart), it automatically retries about every **4 seconds** (±1s of jitter, so retries don't beat on a perfect rhythm). The attempt counter resets on a successful connection.
 
-| Attempt | Wait |
-|---|---|
-| 1 | 5 s |
-| 2 | 10 s |
-| 3 | 20 s |
-| 4 | 40 s |
-| 5+ | 60 s |
+Two things can break that loop on purpose:
 
-The counter resets on a successful connection. Pressing **Disconnect** or **Remove** in the bot manager cancels any pending reconnect immediately.
+- **Antibot cooldowns** — if the server answers with a cooldown ("denied from entering, wait…"), the bot parks itself for the window the server asked for (up to 20 min, plus a margin) instead of retrying, because retrying inside the window just restarts the server's own timer. After 5 cooldown refusals in a row it stops and tells you.
+- **Throttled notices** — Telegram hears about the first three attempts of an outage, then only about once a minute, so a long outage can't flood your chat. Every attempt still goes to the log.
 
-On every successful reconnect the bot's **saved login command** is replayed and its **anti-AFK** loop restarts — you don't have to touch anything.
+Pressing **Disconnect** or **Remove** in the bot manager cancels any pending reconnect immediately.
 
-After 10 failed attempts it stops and tells you; press **🟢 Reconnect** to start over.
+On every successful reconnect the bot's **saved login command** is replayed and its **anti-AFK** loop restarts — you don't have to touch anything. Press **🟢 Reconnect** on a stopped bot to start over.
 
 ---
 
@@ -524,25 +497,6 @@ On startup, bots that were online are reconnected, and bots you had **disconnect
 `SIGINT`/`SIGTERM` (Ctrl-C, `systemctl stop`) disconnects every bot cleanly and flushes state to disk first.
 
 > ⚠️ `userdata.json` contains your saved login passwords in plain text. It's gitignored — keep the file readable only by you.
-
----
-
-## Testing
-
-```bash
-npm test
-```
-
-Runs four suites against stubbed `grammy` and `mineflayer`, so nothing touches Telegram or a real server:
-
-| Suite | Covers |
-|---|---|
-| `test/smoke.js` | access control, validation, all three anti-AFK modes and intervals, auto-login (prompt / fallback / confirm / toggle), command relay, chat batching, cleanup |
-| `test/restart.js` | restoring paused vs. live bots and their settings from `userdata.json` |
-| `test/afk-timer.js` | the anti-AFK timer actually repeating, stopping while offline, and resuming after reconnect |
-| `test/shutdown.js` | `SIGINT` quits every connection, stops polling, and flushes state without losing bots |
-
-`npm test` overwrites `userdata.json` — back it up if you have bots configured.
 
 ---
 

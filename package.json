@@ -1,21 +1,16 @@
 {
   "name": "telegram-mc-bot",
   "version": "1.1.0",
-  "description": "Mineflayer Minecraft bots with Telegram and authenticated web control",
+  "description": "Mineflayer Minecraft bots controlled from Telegram",
   "main": "index.js",
   "license": "MIT",
   "scripts": {
     "start": "node index.js",
-    "web": "node index.js",
-    "bun-start": "bun index.js",
-    "test": "node test/smoke.js && node test/restart.js && node test/afk-timer.js && node test/shutdown.js"
+    "bun-start": "bun index.js"
   },
   "dependencies": {
     "grammy": "^1.36.1",
-    "mineflayer": "^4.23.0",
-    "node-canvas-webgl": "github:PrismarineJS/node-canvas-webgl",
-    "prismarine-viewer": "^1.33.0",
-    "three": "^0.185.1"
+    "mineflayer": "^4.23.0"
   },
   "engines": {
     "bun": ">=1.0",

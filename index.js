@@ -1,13 +1,13 @@
 'use strict';
 
-const { Bot, InlineKeyboard, InputFile } = require('grammy');
+const { Bot, InlineKeyboard } = require('grammy');
 const mineflayer = require('mineflayer');
 const { DEFAULT_FINGERPRINT, isCooldownKick, parseCooldownMs } = require('./antibot');
 const autoEat = require('./autoeat');
 const fs = require('fs');
 const net = require('net');
 const path = require('path');
-const { startWeb } = require('./web');
+const v8 = require('v8');
 
 // Load .env into process.env without pulling in a dependency.
 // Real environment variables always win, so a service definition can override the file.
@@ -57,6 +57,24 @@ const bot = new Bot(TOKEN);
 
 let loading = false;
 
+let saveTimer = null;      // pending debounced write
+let savedPayload = null;   // last payload that actually reached disk
+let pendingPayload = null; // newest payload waiting to be written
+const SAVE_DEBOUNCE_MS = 400;
+
+// The payload is only a few KB; the expensive part was doing a synchronous
+// write on every single UI action (saveData is called ~30 places). Writes are
+// now coalesced: identical state never hits disk twice, and a burst of changes
+// costs one write a moment later. The write itself stays atomic (tmp + rename).
+function writeState(payload) {
+  try {
+    fs.writeFileSync(DATA_TMP, payload, 'utf8');
+    fs.renameSync(DATA_TMP, DATA);
+    savedPayload = payload;
+  } catch (e) { console.error('saveData:', e.message); }
+  pendingPayload = null;
+}
+
 function saveData() {
   if (loading) return;
   const out = {
@@ -83,10 +101,25 @@ function saveData() {
     forwards: Object.fromEntries([...forwardMap].map(([u, s]) => [u, [...s]])),
     active: Object.fromEntries([...activeBot]),
   };
-  try {
-    fs.writeFileSync(DATA_TMP, JSON.stringify(out), 'utf8');
-    fs.renameSync(DATA_TMP, DATA);
-  } catch (e) { console.error('saveData:', e.message); }
+  const payload = JSON.stringify(out);
+  if (payload === savedPayload) { // identical to what's on disk — nothing to do
+    if (saveTimer) { clearTimeout(saveTimer); saveTimer = null; }
+    pendingPayload = null;
+    return;
+  }
+  pendingPayload = payload;
+  if (saveTimer) return; // a write is already scheduled
+  saveTimer = setTimeout(() => {
+    saveTimer = null;
+    if (pendingPayload != null) writeState(pendingPayload);
+  }, SAVE_DEBOUNCE_MS);
+}
+
+// Write any pending state right now — used on shutdown, where the debounce
+// timer would otherwise lose the last few changes to process.exit().
+function flushSave() {
+  if (saveTimer) { clearTimeout(saveTimer); saveTimer = null; }
+  if (pendingPayload != null) writeState(pendingPayload);
 }
 
 function loadData() {
@@ -97,55 +130,60 @@ function loadData() {
     for (const [u, ids] of Object.entries(raw.forwards || {})) forwardMap.set(u, new Set(ids));
     for (const [chatId, name] of Object.entries(raw.active || {})) activeBot.set(Number(chatId), name);
     for (const b of (raw.bots || [])) {
-      const opts = {
-        loginCmd: b.loginCmd || null,
-        loginEnabled: b.loginEnabled !== false,
-        ncLogin: b.ncLogin || null,
-        ncSecond: b.ncSecond || null,
-        ncThird: b.ncThird || null,
-        ncEnabled: b.ncEnabled === true,
-        afkMode: AFK_MODES.has(b.afkMode) ? b.afkMode : 'off',
-        afkIntervalMs: clampInterval(b.afkIntervalMs),
-        autoChatMsg: typeof b.autoChatMsg === 'string' && b.autoChatMsg ? b.autoChatMsg : null,
-        autoChatEnabled: b.autoChatEnabled !== false,
-        autoChatIntervalMs: clampChatInterval(b.autoChatIntervalMs),
-        autoEat: b.autoEat === true,
-      };
-      const cooldownUntil = Number(b.cooldownUntil) || 0;
-      if (b.paused) {
-        // Restore it as a known-but-offline bot; don't dial out on startup.
-        mcBots.set(b.name, {
-          name: b.name, host: b.host, port: b.port, version: b.version,
-          chatId: b.chatId, ownerUsername: b.ownerUsername || null,
-          mcBot: null, status: 'offline',
-          connectedAt: null, error: 'Was disconnected before last shutdown',
-          autoReconnect: false, reconnectAttempts: 0, reconnectTimer: null,
-          cooldownUntil, cooldownWaits: Number(b.cooldownWaits) || 0,
-          ...opts,
-        });
-      } else if (cooldownUntil > Date.now()) {
-        // The antibot had this IP on a timer when we shut down. Joining now would
-        // restart that timer, so come back when it has expired.
-        const delay = Math.min(COOLDOWN_MAX_MS, cooldownUntil - Date.now());
-        const entry = {
-          name: b.name, host: b.host, port: b.port, version: b.version,
-          chatId: b.chatId, ownerUsername: b.ownerUsername || null,
-          mcBot: null, status: 'offline',
-          connectedAt: null, error: `Antibot cooldown — waiting ${humanInterval(delay)}`,
-          autoReconnect: true, reconnectAttempts: 0, reconnectTimer: null,
-          cooldownUntil, cooldownWaits: Number(b.cooldownWaits) || 0,
-          ...opts,
+      // One corrupt record must not cost us every other bot's restoration.
+      try {
+        const opts = {
+          loginCmd: b.loginCmd || null,
+          loginEnabled: b.loginEnabled !== false,
+          ncLogin: b.ncLogin || null,
+          ncSecond: b.ncSecond || null,
+          ncThird: b.ncThird || null,
+          ncEnabled: b.ncEnabled === true,
+          afkMode: AFK_MODES.has(b.afkMode) ? b.afkMode : 'off',
+          afkIntervalMs: clampInterval(b.afkIntervalMs),
+          autoChatMsg: typeof b.autoChatMsg === 'string' && b.autoChatMsg ? b.autoChatMsg : null,
+          autoChatEnabled: b.autoChatEnabled !== false,
+          autoChatIntervalMs: clampChatInterval(b.autoChatIntervalMs),
+          autoEat: b.autoEat === true,
         };
-        mcBots.set(b.name, entry);
-        entry.reconnectTimer = setTimeout(() => {
-          const latest = mcBots.get(b.name);
-          if (latest !== entry || !entry.autoReconnect) return;
-          entry.cooldownUntil = 0;
+        const cooldownUntil = Number(b.cooldownUntil) || 0;
+        if (b.paused) {
+          // Restore it as a known-but-offline bot; don't dial out on startup.
+          mcBots.set(b.name, {
+            name: b.name, host: b.host, port: b.port, version: b.version,
+            chatId: b.chatId, ownerUsername: b.ownerUsername || null,
+            mcBot: null, status: 'offline',
+            connectedAt: null, error: 'Was disconnected before last shutdown',
+            autoReconnect: false, reconnectAttempts: 0, reconnectTimer: null,
+            cooldownUntil, cooldownWaits: Number(b.cooldownWaits) || 0,
+            ...opts,
+          });
+        } else if (cooldownUntil > Date.now()) {
+          // The antibot had this IP on a timer when we shut down. Joining now would
+          // restart that timer, so come back when it has expired.
+          const delay = Math.min(COOLDOWN_MAX_MS, cooldownUntil - Date.now());
+          const entry = {
+            name: b.name, host: b.host, port: b.port, version: b.version,
+            chatId: b.chatId, ownerUsername: b.ownerUsername || null,
+            mcBot: null, status: 'offline',
+            connectedAt: null, error: `Antibot cooldown — waiting ${humanInterval(delay)}`,
+            autoReconnect: true, reconnectAttempts: 0, reconnectTimer: null,
+            cooldownUntil, cooldownWaits: Number(b.cooldownWaits) || 0,
+            ...opts,
+          };
+          mcBots.set(b.name, entry);
+          entry.reconnectTimer = setTimeout(() => {
+            const latest = mcBots.get(b.name);
+            if (latest !== entry || !entry.autoReconnect) return;
+            entry.cooldownUntil = 0;
+            spawnBot(b.name, b.host, b.port, b.version, b.chatId, b.ownerUsername, opts);
+          }, delay);
+          if (entry.reconnectTimer.unref) entry.reconnectTimer.unref();
+        } else {
           spawnBot(b.name, b.host, b.port, b.version, b.chatId, b.ownerUsername, opts);
-        }, delay);
-        if (entry.reconnectTimer.unref) entry.reconnectTimer.unref();
-      } else {
-        spawnBot(b.name, b.host, b.port, b.version, b.chatId, b.ownerUsername, opts);
+        }
+      } catch (e) {
+        console.error(`loadData: skipping bot ${JSON.stringify(b && b.name)} — ${e.message}`);
       }
     }
   } catch (e) { console.error('loadData:', e.message); }
@@ -167,10 +205,6 @@ const norm = u => String(u || '').replace(/^@/, '').toLowerCase();
 const ownerTag = b => b.ownerUsername ? `@${b.ownerUsername}` : `#${b.chatId}`;
 
 const notify = (chatId, text) => bot.api.sendMessage(chatId, text, { parse_mode: 'HTML' }).catch(() => {});
-
-const notifyPhoto = (chatId, buf, caption) =>
-  bot.api.sendPhoto(chatId, new InputFile(buf, 'captcha.png'), { caption, parse_mode: 'HTML' })
-    .catch(() => notify(chatId, caption + '\n\n⚠️ (Telegram refused the image)'));
 
 // Flatten anything the server might hand us — a ChatMessage, a raw JSON string,
 // or a nested {text, extra:[...]} tree — into plain readable text.
@@ -236,7 +270,7 @@ const stripCodes = s => String(s)
 // Telegram commands owned by this bot — never relayed to Minecraft.
 const RESERVED = new Set([
   'start', 'help', 'forward', 'unforward', 'forwards',
-  'cmd', 'say', 'use', 'console', 'bots', 'afk', 'setlogin', 'click', 'where',
+  'cmd', 'say', 'use', 'console', 'bots', 'afk', 'setlogin', 'click', 'where', 'players',
 ]);
 const MC_MAX_LEN = 256;
 const SEND_GAP_MS = 400;
@@ -386,6 +420,41 @@ function getState(chatId) {
   return s;
 }
 
+// States and capture windows expire on paper immediately, but were only
+// reaped when the same chat/bot came back. Sweep periodically so a chat (or a
+// quiet bot) that never returns can't leave entries behind forever.
+const STATE_SWEEP_MS = 5 * 60 * 1000;
+const sweepTimer = setInterval(() => {
+  const now = Date.now();
+  for (const [id, s] of chatStates) if (s.expires && now > s.expires) chatStates.delete(id);
+  for (const [nm, c] of captures) if (now > c.until) captures.delete(nm);
+}, STATE_SWEEP_MS);
+if (sweepTimer.unref) sweepTimer.unref();
+
+// --- heap watchdog ---------------------------------------------------------
+// This process is meant to stay up for weeks, so a slow leak used to stay
+// invisible until the runtime aborted with "heap out of memory". Log the live
+// heap now and then, and when it crosses 80% of V8's own limit say so in the
+// chats that own bots — a regression shows up as a message, not a crash.
+const HEAP_LOG_MS = 15 * 60 * 1000;
+const HEAP_WARN_RATIO = 0.8;
+const HEAP_WARN_GAP_MS = 30 * 60 * 1000;
+let heapWarnedAt = 0;
+const heapTimer = setInterval(() => {
+  const { heapUsed, rss } = process.memoryUsage();
+  const limit = v8.getHeapStatistics().heap_size_limit || 0;
+  const used = heapUsed / 1048576;
+  console.log(`[memory] heap ${used.toFixed(0)}/${(limit / 1048576).toFixed(0)} MB (${limit ? Math.round(used / (limit / 1048576) * 100) : 0}%) · rss ${(rss / 1048576).toFixed(0)} MB · bots ${mcBots.size}`);
+  if (!limit || heapUsed < limit * HEAP_WARN_RATIO) return;
+  if (Date.now() - heapWarnedAt < HEAP_WARN_GAP_MS) return;
+  heapWarnedAt = Date.now();
+  const text = `⚠️ <b>Memory warning</b> — this service is using <b>${Math.round(heapUsed / limit * 100)}%</b> of its heap ` +
+    `(${used.toFixed(0)} of ${(limit / 1048576).toFixed(0)} MB) with ${mcBots.size} bot(s).\n\n` +
+    `It will reconnect every bot automatically after a restart; if the number keeps climbing, restart it from the host panel.`;
+  for (const chatId of new Set([...mcBots.values()].map(b => b.chatId).filter(Boolean))) notify(chatId, text);
+}, HEAP_LOG_MS);
+if (heapTimer.unref) heapTimer.unref();
+
 // Space sends out so a burst never trips the server's chat-spam kick.
 function queueSend(info, text, front = false) {
   if (!info.sendQueue) info.sendQueue = [];
@@ -486,7 +555,7 @@ function botManageText(b) {
     ? `\n<b>Anti-AFK:</b> ${AFK_LABEL[b.afkMode]} every <b>${humanInterval(b.afkIntervalMs)}</b>`
     : `\n<b>Anti-AFK:</b> off`;
   const food = b.status === 'online' && b.mcBot?.food != null ? `\n<b>Hunger:</b> ${Math.round(b.mcBot.food)} / 20` : '';
-  const eat = b.autoEat ? `\n<b>Auto-Eat:</b> on (eats below ${autoEat.EAT_AT_FOOD}/20)` : `\n<b>Auto-Eat:</b> off`;
+  const eat = b.autoEat ? `\n<b>Auto-Eat:</b> on (eats to heal when hurt)` : `\n<b>Auto-Eat:</b> off`;
   const login = b.loginCmd
     ? `\n<b>Auto-login:</b> ${b.loginEnabled === false ? 'saved but <b>disabled</b>' : 'on'} - <code>${esc(maskLogin(b.loginCmd))}</code>`
     : `\n<b>Auto-login:</b> not set`;
@@ -507,7 +576,7 @@ function botManageKeyboard(name) {
   if (b?.status === 'online' || b?.status === 'connecting') kb.text('Disconnect', `disconnect:${name}`);
   else kb.text('Reconnect', `reconnect:${name}`);
   kb.text('Console', `console:${name}`).text('Hotbar', `hotbar:${name}`).row();
-  kb.text('📸 Screenshot', `shot:${name}`).row();
+  kb.text('📍 Where', `where:${name}`).row();
   kb.text(`Auto-Eat: ${b?.autoEat ? 'ON' : 'OFF'}`, `autoeat:${name}`).row();
   kb.text(`Anti-AFK: ${AFK_LABEL[b?.afkMode || 'off']}`, `afk:${name}`).row();
   kb.text(b?.loginCmd ? 'Auto-login' : 'Set auto-login', `login:${name}`).row();
@@ -656,11 +725,14 @@ function scheduleAutoChat(info) {
 }
 
 function stopAfk(info) {
+  // Invalidate every callback a pulse may still have pending.
+  info.afkGen = (info.afkGen || 0) + 1;
   if (info.afkTimer) { clearTimeout(info.afkTimer); info.afkTimer = null; }
   if (info.afkStepTimers) { for (const t of info.afkStepTimers) clearTimeout(t); info.afkStepTimers = []; }
   const mc = info.mcBot;
   if (mc) {
-    for (const c of ['forward', 'back', 'jump']) { try { mc.setControlState(c, false); } catch (_) {} }
+    // sneak/sprint too: stopping mid-pulse must not leave the player creeping.
+    for (const c of ['forward', 'back', 'jump', 'sneak', 'sprint']) { try { mc.setControlState(c, false); } catch (_) {} }
   }
 }
 
@@ -688,11 +760,15 @@ function destroyBot(info) {
   stopNeocraft(info);
   stopAutoChat(info);
   if (info.eatDisposer) { try { info.eatDisposer(); } catch (_) {} info.eatDisposer = null; }
-  try { require('./viewer').destroyViewer(info); } catch (_) {}
   if (info.mcBot) {
     const mc = info.mcBot;
     info.mcBot = null;
-    mc.removeAllListeners();
+    // Detach only this manager's listeners (see spawnBot). mineflayer's own
+    // bot-level listeners include physics' `bot.on('end', cleanup)`, the only
+    // thing that clears its 20 Hz tick interval — removeAllListeners() here let
+    // that interval keep running and hold the whole Bot (world, chunks, entities)
+    // in memory after every reconnect, until the heap ran out.
+    if (info.detachListeners) info.detachListeners();
     // quit() can emit 'error' on a half-open socket; an unhandled one would crash us.
     mc.on('error', () => {});
     try { mc.quit(); } catch (_) {}
@@ -708,9 +784,14 @@ function afkPulse(info) {
   const mode = info.afkMode || 'off';
   if (mode === 'off') return;
 
-  if (!info.afkStepTimers) info.afkStepTimers = [];
+  // New generation: any callback left pending by an earlier pulse (or by a
+  // stopAfk that raced this one) sees a changed gen and no-ops. The timer list
+  // also starts fresh here — it was previously only cleared by stopAfk, so
+  // fired timers piled up for the whole lifetime of the connection.
+  const gen = (info.afkGen = (info.afkGen || 0) + 1);
+  info.afkStepTimers = [];
   const at = (ms, fn) => info.afkStepTimers.push(setTimeout(() => {
-    if (info.mcBot !== mc || info.status !== 'online') return;
+    if (info.afkGen !== gen || info.mcBot !== mc || info.status !== 'online') return;
     try { fn(); } catch (e) { info.error = `Anti-AFK: ${e.message}`; }
   }, ms));
 
@@ -751,11 +832,9 @@ function afkPulse(info) {
     try { mc.setControlState('forward', true); } catch (_) {}
     at(stepDuration, () => {
       mc.setControlState('forward', false);
-      // Small pause before going back (more human)
-      setTimeout(() => {
-        if (info.mcBot !== mc || info.status !== 'online') return;
-        mc.setControlState('back', true);
-      }, 50 + Math.floor(Math.random() * 100));
+      // Small pause before going back (more human). Tracked through at() so a
+      // stopAfk during the pause can't leave the player walking backward.
+      at(50 + Math.floor(Math.random() * 100), () => mc.setControlState('back', true));
     });
     at(stepDuration * 2 + 50, () => mc.setControlState('back', false));
     
@@ -770,10 +849,7 @@ function afkPulse(info) {
     if (Math.random() > 0.95) {
       at(100, () => {
         mc.setControlState('sprint', true);
-        setTimeout(() => {
-          if (info.mcBot !== mc) return;
-          mc.setControlState('sprint', false);
-        }, 200 + Math.floor(Math.random() * 300));
+        at(200 + Math.floor(Math.random() * 300), () => mc.setControlState('sprint', false));
       });
     }
   }
@@ -887,10 +963,16 @@ function scheduleNeocraft(info) {
   }, NC_LOGIN_DELAY_MS);
 }
 
-// How often to probe the outbound TCP path to the host while "online". Catches
-// a half-open socket (host sleep, NAT drop, dead link) in under 5 minutes, so
-// the watchdog of the protocol library doesn't have to kill us later.
-const PROBE_INTERVAL_MS = 4 * 60000;
+// Inbound-activity-driven connectivity probe. The spawn handler timestamps
+// every packet that arrives; a lightweight check runs every PROBE_CHECK_MS and
+// only opens a TCP probe when nothing has arrived for PROBE_SILENCE_MS. A
+// healthy connection (keepalives ~every 15s) therefore costs zero extra
+// connections instead of one every few minutes — which also keeps us from
+// looking like a bot to connection-counting antibots — while a half-open socket
+// (host sleep, NAT drop, dead link) is still caught well before the protocol
+// library's 60s keepalive watchdog fires.
+const PROBE_CHECK_MS = 30000;   // cadence of the inbound-activity check
+const PROBE_SILENCE_MS = 25000; // inbound quiet longer than this ⇒ open a probe
 const PROBE_DEAD_MS = 10000;          // 10s of stalls = the path is dead, not lag
 const PROBE_SOCKET_TIMEOUT_MS = 8000;
 // Fixed reconnect interval (user preference): always retry after ~4s instead of
@@ -1040,6 +1122,27 @@ async function spawnBot(name, host, port, version, chatId, ownerUsername, opts =
   // a socket error that arrives before our listener is attached.
   mcBot.on('error', () => {});
 
+  // ---- listener bookkeeping -------------------------------------------------
+  // Everything this manager attaches to the bot is recorded so teardown removes
+  // exactly ours. This matters more than it looks: mineflayer's plugins register
+  // bot-level listeners too — physics clears its 20 Hz tick interval from
+  // `bot.on('end')` — so `bot.removeAllListeners()` silently disarmed that
+  // cleanup, leaving a live interval that kept the whole Bot (world + chunks +
+  // entities, ~0.7 MB) reachable. Repeated reconnects then grew the heap until
+  // the process died with "Ineffective mark-compacts near heap limit".
+  const ownListeners = [];
+  const onBot = (event, fn) => { mcBot.on(event, fn); ownListeners.push([event, fn]); return fn; };
+  const onceBot = (event, fn) => { mcBot.once(event, fn); ownListeners.push([event, fn]); return fn; };
+  info.detachListeners = () => {
+    for (const [event, fn] of ownListeners) { try { mcBot.off(event, fn); } catch (_) {} }
+    ownListeners.length = 0;
+    // The inbound-activity stamp lives on the raw protocol client, not the bot.
+    if (info.inboundListener) {
+      try { mcBot._client.off('packet', info.inboundListener); } catch (_) {}
+      info.inboundListener = null;
+    }
+  };
+
   function scheduleReconnect() {
     const current = mcBots.get(name);
     if (!current || current !== info || !current.autoReconnect) return;
@@ -1085,7 +1188,15 @@ async function spawnBot(name, host, port, version, chatId, ownerUsername, opts =
     const isTimeout = !!current.timeoutConnected;
     const delay = retryDelay(current.reconnectAttempts, isTimeout);
     const marker = isTimeout ? ' (no keepalive — server stalled or restarting)' : '';
-    notify(chatId, `🔄 <b>${esc(name)}</b> reconnecting in ${Math.round(delay / 1000)}s (attempt ${current.reconnectAttempts})${marker}…`);
+    // Fixed ~4s retries can run for a long time; announce the first three
+    // attempts, then only every 15th (~once a minute) so a long outage can't
+    // flood the chat. Every attempt still goes to the log.
+    const att = current.reconnectAttempts;
+    if (att <= 3 || att % 15 === 0) {
+      notify(chatId, `🔄 <b>${esc(name)}</b> reconnecting in ${Math.round(delay / 1000)}s (attempt ${att})${marker}…`);
+    } else {
+      console.log(`[${name}] reconnect attempt ${att} (notification throttled)`);
+    }
     current.reconnectTimer = setTimeout(() => {
       const latest = mcBots.get(name);
       if (!latest || latest !== info || !latest.autoReconnect) return;
@@ -1107,15 +1218,20 @@ async function spawnBot(name, host, port, version, chatId, ownerUsername, opts =
     stopLogin(info);
     stopNeocraft(info);
     if (info.eatDisposer) { try { info.eatDisposer(); } catch (_) {} info.eatDisposer = null; }
-    try { require('./viewer').destroyViewer(info); } catch (_) {}
     info.status = status;
     info.error = errText;
     info.mcBot = null;
     if (info.probeTimer) { clearTimeout(info.probeTimer); info.probeTimer = null; }
     if (info.sendTimer) { clearTimeout(info.sendTimer); info.sendTimer = null; }
     info.sendQueue = [];
-    mcBot.removeAllListeners();
-    mcBot.on('error', () => {});
+    // Only this manager's listeners may go: mineflayer's plugins keep their own
+    // bot-level listeners (physics clears its tick interval from 'end'), and
+    // wiping those out was what leaked a whole Bot per reconnect.
+    info.detachListeners();
+    // If the socket is somehow still open (a kick that was never followed by a
+    // real 'end'), close it now — mineflayer's per-connection cleanup runs on
+    // 'end' and must not be left waiting for a stalled socket.
+    if (mcBot._client && !mcBot._client.ended) { try { mcBot.quit(); } catch (_) {} }
     saveData();
     if (tgText) notify(chatId, tgText);
     
@@ -1124,12 +1240,12 @@ async function spawnBot(name, host, port, version, chatId, ownerUsername, opts =
 
   // 1. Resource packs. Accepting them on join keeps servers that require the
   //    pack from kicking the player for never answering the request.
-  mcBot.on('resourcePack', () => {
+  onBot('resourcePack', () => {
     if (mcBots.get(name) !== info) return;
     try { mcBot.acceptResourcePack(); } catch (_) {}
   });
 
-  mcBot.once('spawn', () => {
+  onceBot('spawn', () => {
     if (mcBots.get(name) !== info) return;
     info.status = 'online';
     info.connectedAt = Date.now();
@@ -1162,10 +1278,16 @@ async function spawnBot(name, host, port, version, chatId, ownerUsername, opts =
     // the server timed us out. Catching the dead path ourselves and reconnecting
     // with fresh sockets keeps sessions alive for days instead of hours.
     if (info.probeTimer) { clearTimeout(info.probeTimer); info.probeTimer = null; }
+    // Timestamp every inbound packet so a healthy connection never costs a probe.
+    info.lastInboundAt = Date.now();
+    info.inboundListener = () => { info.lastInboundAt = Date.now(); };
+    try { mcBot._client.on('packet', info.inboundListener); } catch (_) { info.inboundListener = null; }
     const armProbe = () => {
       if (mcBots.get(name) !== info || info.status !== 'online' || !info.mcBot) return;
-      pollConnectivity(info);
-      info.probeTimer = setTimeout(armProbe, PROBE_INTERVAL_MS);
+      // Only dial out when inbound has gone quiet — quiet is the symptom of the
+      // half-open sockets this probe exists to catch.
+      if (Date.now() - (info.lastInboundAt || 0) > PROBE_SILENCE_MS) pollConnectivity(info);
+      info.probeTimer = setTimeout(armProbe, PROBE_CHECK_MS);
       if (info.probeTimer.unref) info.probeTimer.unref();
     };
     armProbe();
@@ -1195,7 +1317,7 @@ async function spawnBot(name, host, port, version, chatId, ownerUsername, opts =
             if (!mc || info.status !== 'online') return;
             mc.setControlState('jump', true);
             setTimeout(() => {
-              if (!mc) return;
+              if (!mc || info.status !== 'online') return;
               mc.setControlState('jump', false);
             }, 100 + Math.floor(Math.random() * 150));
           }, 2000 + Math.floor(Math.random() * 1500));
@@ -1207,7 +1329,7 @@ async function spawnBot(name, host, port, version, chatId, ownerUsername, opts =
             if (!mc || info.status !== 'online') return;
             mc.setControlState('sneak', true);
             setTimeout(() => {
-              if (!mc) return;
+              if (!mc || info.status !== 'online') return;
               mc.setControlState('sneak', false);
             }, 200 + Math.floor(Math.random() * 300));
           }, 3000 + Math.floor(Math.random() * 1500));
@@ -1254,7 +1376,7 @@ async function spawnBot(name, host, port, version, chatId, ownerUsername, opts =
     }, startDelay);
   });
 
-  mcBot.on('kicked', reason => {
+  onBot('kicked', reason => {
     let r = 'unknown reason';
     let isAntiBot = false;
     let isTooFast = false;
@@ -1360,7 +1482,7 @@ async function spawnBot(name, host, port, version, chatId, ownerUsername, opts =
     markDown('offline', `Kicked: ${r}`, `${emoji} <b>${esc(name)}</b> ${prefix}:\n<code>${esc(r)}</code>${extraInfo}`);
   });
 
-  mcBot.on('error', err => {
+  onBot('error', err => {
     let msg = err?.message || String(err);
     if (err?.code === 'ECONNREFUSED') msg = 'Connection refused — server offline or wrong port';
     else if (err?.code === 'ECONNRESET') msg = 'Connection reset — check version or server is in online-mode';
@@ -1385,7 +1507,7 @@ async function spawnBot(name, host, port, version, chatId, ownerUsername, opts =
     markDown('error', msg, `🔴 <b>${esc(name)}</b> error: <code>${esc(msg)}</code>`);
   });
 
-  mcBot.on('end', reason => {
+  onBot('end', reason => {
     if (info.status !== 'online' && info.status !== 'connecting') return;
     const rs = typeof reason === 'string' ? reason : '';
     if (rs === 'connectivityLost') {
@@ -1397,13 +1519,13 @@ async function spawnBot(name, host, port, version, chatId, ownerUsername, opts =
     markDown('offline', rs || 'Connection closed', null);
   });
 
-  mcBot.on('death', () => {
+  onBot('death', () => {
     if (mcBots.get(name) !== info) return;
     info.error = 'Died — respawning';
     notify(chatId, `💀 <b>${esc(name)}</b> died. Respawning…`);
   });
 
-  mcBot.on('message', jsonMsg => {
+  onBot('message', jsonMsg => {
     const clean = readChat(jsonMsg);
     if (!clean) return;
 
@@ -1440,7 +1562,7 @@ bot.command('start', async ctx => {
 });
 
 const HELP_TEXT = () =>
-  `⭐ <b>Help &amp; Usage</b>\n\n<b>➕ Adding a bot</b>\nPress <i>Add Bot</i> then send:\n<code>name  ip  port  [version]</code>\nUse <code>auto</code> as the version to detect the server's own.\n\n<b>Anti-AFK</b> 🏃\nOn a bot's manage screen press <b>Anti-AFK</b>:\n• <b>Jump only</b> — hops in place\n• <b>Walk 1 block</b> — one block forward, one back\n• <b>Jump + Walk</b> — both\nPick any interval from 15s to 30m, or a custom one.\n\n<b>Auto-login</b> 🔐\nPress <b>Set auto-login</b> and send the command your server needs, e.g. <code>/login 1597311</code>. It's saved for that bot and replayed on every reconnect, only when the server asks for it.\n\n<b>Commands</b>\n<code>/bots</code> — list your bots\n<code>/use [name]</code> — pick the bot that runs commands\n<code>/cmd [name] &lt;command&gt;</code> — send a command\n<code>/say &lt;text&gt;</code> — send plain chat\n<code>/click [name] &lt;slot&gt;</code> — click a GUI slot\n<code>/afk [name] &lt;off|jump|walk|both&gt; [interval]</code>\n<code>/setlogin [name] &lt;command&gt;</code>\n<code>/console [name]</code> — open a bot's console\n<code>/forward @you</code> — forward server chat to a group\n\nAnything else starting with <code>/</code> goes straight to the server.`;
+  `⭐ <b>Help &amp; Usage</b>\n\n<b>➕ Adding a bot</b>\nPress <i>Add Bot</i> then send:\n<code>name  ip  port  [version]</code>\nUse <code>auto</code> as the version to detect the server's own.\n\n<b>Anti-AFK</b> 🏃\nOn a bot's manage screen press <b>Anti-AFK</b>:\n• <b>Jump only</b> — hops in place\n• <b>Walk 1 block</b> — one block forward, one back\n• <b>Jump + Walk</b> — both\nPick any interval from 15s to 30m, or a custom one.\n\n<b>Auto-login</b> 🔐\nPress <b>Set auto-login</b> and send the command your server needs, e.g. <code>/login 1597311</code>. It's saved for that bot and replayed on every reconnect, only when the server asks for it.\n\n<b>Commands</b>\n<code>/bots</code> — list your bots\n<code>/use [name]</code> — pick the bot that runs commands\n<code>/cmd [name] &lt;command&gt;</code> — send a command\n<code>/say &lt;text&gt;</code> — send plain chat\n<code>/click [name] &lt;slot&gt;</code> — click a GUI slot\n<code>/afk [name] &lt;off|jump|walk|both&gt; [interval]</code>\n<code>/setlogin [name] &lt;command&gt;</code>\n<code>/console [name]</code> — open a bot's console\n<code>/players [name]</code> — list everyone on the server\n<code>/forward @you</code> — forward server chat to a group\n\nAnything else starting with <code>/</code> goes straight to the server.`;
 
 bot.command('help', async ctx => {
   await ctx.reply(HELP_TEXT(), {
@@ -1453,35 +1575,77 @@ bot.command('bots', async ctx => {
   await ctx.reply(botListText(ctx), { parse_mode: 'HTML', reply_markup: botListKeyboard(ctx) });
 });
 
-// "Where is the bot?" — position, world, health and uptime at a glance. Useful
-// exactly when a screenshot can't be rendered or the bot seems to have vanished.
-bot.command('where', async ctx => {
-  const parts = ctx.message.text.trim().split(/\s+/).slice(1);
-  const { info, error, keyboard } = takeBotArg(ctx, parts);
-  if (!info) return ctx.reply(error || 'No bot found.', { parse_mode: 'HTML', reply_markup: keyboard });
-  if (!canControl(ctx, info)) return ctx.reply(`❌ <b>${esc(info.name)}</b> isn't yours to control.`, { parse_mode: 'HTML' });
-
+// "Where is the bot?" — position, world, health and uptime at a glance,
+// for when the bot seems to have vanished or you just need its coordinates.
+function whereText(info) {
   if (info.status !== 'online' || !info.mcBot) {
-    return ctx.reply(`📍 <b>${esc(info.name)}</b> is <b>${info.status}</b> — last known state:\n<code>${esc(info.error || 'none')}</code>`, { parse_mode: 'HTML' });
+    return `📍 <b>${esc(info.name)}</b> is <b>${info.status}</b> — last known state:\n<code>${esc(info.error || 'none')}</code>`;
   }
-
   const b = info.mcBot;
   const p = b.entity?.position;
-  if (!p) return ctx.reply(`📍 <b>${esc(info.name)}</b> is online but its position isn't known yet.`, { parse_mode: 'HTML' });
-
+  if (!p) return `📍 <b>${esc(info.name)}</b> is online but its position isn't known yet.`;
   const dim = b.game?.dimension ? esc(b.game.dimension) : '?';
   const held = b.heldItem ? `${b.heldItem.count > 1 ? `${b.heldItem.count}x ` : ''}${esc(b.heldItem.displayName || b.heldItem.name)}` : 'empty hand';
   const ut = info.connectedAt ? uptime(Date.now() - info.connectedAt) : '?';
-  await ctx.reply(
-    `📍 <b>${esc(info.name)}</b> — here's where it stands\n\n` +
+  return `📍 <b>${esc(info.name)}</b> — here's where it stands\n\n` +
     `<b>XYZ:</b> <code>${p.x.toFixed(1)}, ${p.y.toFixed(1)}, ${p.z.toFixed(1)}</code>\n` +
     `<b>World:</b> ${dim}\n` +
     `<b>Health:</b> ${Math.round(b.health ?? 0)}/20 · <b>Food:</b> ${Math.round(b.food ?? 0)}/20\n` +
     `<b>Holding:</b> ${held}\n` +
     `<b>Online for:</b> ${ut}\n\n` +
-    `Server: <code>${esc(info.host)}:${info.port}</code>`,
-    { parse_mode: 'HTML', reply_markup: new InlineKeyboard().text('📸 Screenshot', `shot:${info.name}`).text('⚙️ Manage', `manage:${info.name}`).row().text('⌨️ Console', `console:${info.name}`) }
-  );
+    `Server: <code>${esc(info.host)}:${info.port}</code>`;
+}
+
+const whereKeyboard = name => new InlineKeyboard()
+  .text('🔄 Refresh', `where:${name}`)
+  .text('⚙️ Manage', `manage:${name}`).row()
+  .text('⌨️ Console', `console:${name}`);
+
+bot.command('where', async ctx => {
+  const parts = ctx.message.text.trim().split(/\s+/).slice(1);
+  const { info, error, keyboard } = takeBotArg(ctx, parts);
+  if (!info) return ctx.reply(error || 'No bot found.', { parse_mode: 'HTML', reply_markup: keyboard });
+  if (!canControl(ctx, info)) return ctx.reply(`❌ <b>${esc(info.name)}</b> isn't yours to control.`, { parse_mode: 'HTML' });
+  await ctx.reply(whereText(info), { parse_mode: 'HTML', reply_markup: whereKeyboard(info.name) });
+});
+
+function playersText(info) {
+  if (info.status !== 'online' || !info.mcBot) {
+    return `👥 <b>${esc(info.name)}</b> is <b>${info.status}</b> — no live player list.`;
+  }
+  const mc = info.mcBot;
+  const me = (mc.username || info.name).toLowerCase();
+  // bot.players is the server's tab list: everyone online, near or far.
+  const rows = [];
+  const seen = new Set();
+  for (const p of Object.values(mc.players || {})) {
+    if (!p || !p.username || seen.has(p.username)) continue;
+    seen.add(p.username);
+    const ping = Number.isFinite(p.ping) && p.ping >= 0 ? Math.round(p.ping) : null;
+    rows.push({ name: p.username, ping, self: p.username.toLowerCase() === me });
+  }
+  if (!rows.length) return `👥 <b>${esc(info.name)}</b> — the server hasn't sent a player list yet.`;
+  rows.sort((a, b) => a.name.localeCompare(b.name));
+  const lines = rows.slice(0, 80).map((r, i) => {
+    const bits = [];
+    if (r.self) bits.push('this bot');
+    if (r.ping != null) bits.push(`${r.ping}ms`);
+    return `${i + 1}. <b>${esc(r.name)}</b>${bits.length ? ` <i>(${bits.join(' · ')})</i>` : ''}`;
+  });
+  const more = rows.length > 80 ? `\n… and ${rows.length - 80} more` : '';
+  return `👥 <b>Players on ${esc(info.host)}:${info.port}</b> — <b>${rows.length}</b> online\n\n${lines.join('\n')}${more}`;
+}
+
+const playersKeyboard = name => new InlineKeyboard()
+  .text('🔄 Refresh', `players:${name}`)
+  .text('⚙️ Manage', `manage:${name}`).row();
+
+bot.command('players', async ctx => {
+  const parts = ctx.message.text.trim().split(/\s+/).slice(1);
+  const { info, error, keyboard } = takeBotArg(ctx, parts);
+  if (!info) return ctx.reply(error || 'No bot found.', { parse_mode: 'HTML', reply_markup: keyboard });
+  if (!canControl(ctx, info)) return ctx.reply(`❌ <b>${esc(info.name)}</b> isn't yours to control.`, { parse_mode: 'HTML' });
+  await ctx.reply(playersText(info), { parse_mode: 'HTML', reply_markup: playersKeyboard(info.name) });
 });
 
 bot.command('console', async ctx => {
@@ -1813,50 +1977,12 @@ bot.on('callback_query:data', async ctx => {
       return answer(`✅ Holding slot ${idx + 1}`);
     }
 
-    case 'shot': {
-      if (info.status !== 'online' || !info.mcBot) {
-        return answer(`⚠️ ${info.name} is ${info.status} — connect it first.`);
-      }
-      if (info.shotBusy) return answer('Already rendering — wait a moment.');
-      info.shotBusy = true;
-      await answer('Rendering 4 views…');
-      try {
-        const viewer = require('./viewer');
-        const shots = await viewer.takeFourScreenshots(info);
-        const b = info.mcBot;
-        const p = b?.entity?.position;
-        const where = p
-          ? `\n📍 XYZ: <b>${p.x.toFixed(1)}, ${p.y.toFixed(1)}, ${p.z.toFixed(1)}</b>${b.game?.dimension ? ` · ${esc(b.game.dimension)}` : ''}`
-          : '';
-        const caption = `<b>${esc(name)}</b> — 4 directions from where it stands${where}\n` +
-          shots.map((s, i) => `${i + 1}. ${s.label}`).join(' · ');
-        const media = shots.map((s, i) => ({
-          type: 'photo',
-          media: new InputFile(s.buffer, `shot-${i + 1}.jpg`),
-          ...(i === 0 ? { caption, parse_mode: 'HTML' } : {}),
-        }));
-        await bot.api.sendMediaGroup(chatId, media).catch(async () => {
-          // Album refused (rare) — fall back to four single photos.
-          for (const [i, s] of shots.entries()) {
-            await notifyPhoto(chatId, s.buffer, `${i + 1}. ${s.label} — ${esc(name)}`);
-          }
-        });
-      } catch (e) {
-        // A broken GL context won't recover — drop the cached renderer.
-        try { require('./viewer').destroyViewer(info); } catch (_) {}
-        notify(chatId, `<b>${esc(name)}</b> — screenshot failed:\n<code>${esc(e.message)}</code>`);
-      } finally {
-        info.shotBusy = false;
-      }
-      return answer();
-    }
-
     case 'autoeat': {
       info.autoEat = !info.autoEat;
       saveData();
       await edit(botManageText(info), botManageKeyboard(name));
       return answer(info.autoEat
-        ? `Auto-Eat on — eats when hunger ≤ ${autoEat.EAT_AT_FOOD}/20`
+        ? `Auto-Eat on — eats whenever health drops below full`
         : 'Auto-Eat off');
     }
 
@@ -1958,6 +2084,18 @@ bot.on('callback_query:data', async ctx => {
       activeBot.set(chatId, name);
       saveData();
       return answer(`✅ Commands now run as ${name}`);
+
+    case 'where': {
+      chatStates.delete(chatId);
+      await edit(whereText(info), whereKeyboard(name));
+      return answer();
+    }
+
+    case 'players': {
+      chatStates.delete(chatId);
+      await edit(playersText(info), playersKeyboard(name));
+      return answer();
+    }
 
     case 'console':
       activeBot.set(chatId, name);
@@ -2388,7 +2526,7 @@ function shutdown(signal) {
   if (shuttingDown) return;
   shuttingDown = true;
   console.log(`\n${signal} — disconnecting ${mcBots.size} bot(s)…`);
-  try { saveData(); } catch (_) {}
+  try { flushSave(); } catch (_) {}
   for (const info of mcBots.values()) {
     // Keep autoReconnect as-is so bots come back up on the next start.
     if (info.reconnectTimer) clearTimeout(info.reconnectTimer);
@@ -2396,9 +2534,12 @@ function shutdown(signal) {
     stopAutoChat(info);
     stopLogin(info);
     if (info.eatDisposer) { try { info.eatDisposer(); } catch (_) {} info.eatDisposer = null; }
-    try { require('./viewer').destroyViewer(info); } catch (_) {}
     if (info.sendTimer) clearTimeout(info.sendTimer);
-    if (info.mcBot) { info.mcBot.removeAllListeners(); info.mcBot.on('error', () => {}); try { info.mcBot.quit(); } catch (_) {} }
+    if (info.mcBot) {
+      if (info.detachListeners) info.detachListeners();
+      info.mcBot.on('error', () => {});
+      try { info.mcBot.quit(); } catch (_) {}
+    }
   }
   for (const box of outbox.values()) if (box.timer) clearTimeout(box.timer);
   bot.stop().catch(() => {}).finally(() => process.exit(0));
@@ -2410,61 +2551,6 @@ process.once('SIGTERM', () => shutdown('SIGTERM'));
 console.log('🚀 Minecraft Bot Manager starting…');
 loadData();
 
-// The web panel shares the same in-memory bot registry as Telegram. It is
-// intentionally dependency-free so it works on Railway and small VPS hosts.
-const WEB_PORT = Number(process.env.WEB_PORT || process.env.PORT || 3000);
-const WEB_TOKEN = process.env.WEB_TOKEN || process.env.WEB_API_TOKEN || '';
-const web = startWeb({
-  port: WEB_PORT,
-  token: WEB_TOKEN,
-  get: name => mcBots.get(name),
-  list: () => [...mcBots.values()],
-  connect: async ({ name, host, port, version }) => {
-    const existing = mcBots.get(name);
-    if (existing && (existing.status === 'online' || existing.status === 'connecting')) throw new Error(`${name} is already ${existing.status}`);
-    spawnBot(name, host, port, version || AUTO_VERSION, 0, 'web', {
-      loginCmd: existing?.loginCmd ?? null, loginEnabled: existing?.loginEnabled !== false,
-      ncLogin: existing?.ncLogin ?? null, ncSecond: existing?.ncSecond ?? null, ncThird: existing?.ncThird ?? null, ncEnabled: existing?.ncEnabled === true,
-      afkMode: existing?.afkMode ?? 'off', afkIntervalMs: existing?.afkIntervalMs ?? DEFAULT_AFK_INTERVAL_MS,
-      autoChatMsg: existing?.autoChatMsg ?? null, autoChatEnabled: existing?.autoChatEnabled !== false,
-      autoChatIntervalMs: existing?.autoChatIntervalMs ?? DEFAULT_AUTOCHAT_INTERVAL_MS, autoEat: existing?.autoEat === true,
-    });
-    saveData();
-  },
-  screenshot: info => require('./viewer').takeFourScreenshots(info).then(shots => shots[0].buffer),
-  action: async (info, body) => {
-    const action = String(body.action || '');
-    if (action === 'reconnect') {
-      if (info.status === 'online' || info.status === 'connecting') throw new Error('Bot is already connected');
-      info.cooldownUntil = 0; info.cooldownWaits = 0; info.autoReconnect = true;
-      return web.connect({ name: info.name, host: info.host, port: info.port, version: info.version });
-    }
-    if (action === 'disconnect') { info.autoReconnect = false; destroyBot(info); info.status = 'offline'; info.error = 'Disconnected by user'; saveData(); return; }
-    if (action === 'remove') { info.autoReconnect = false; destroyBot(info); mcBots.delete(info.name); saveData(); return; }
-    if (info.status !== 'online' || !info.mcBot) throw new Error('Bot is not online');
-    const mc = info.mcBot;
-    if (action === 'chat') {
-      const text = String(body.text || '').trim();
-      if (!text || text.length > MC_MAX_LEN) throw new Error(`Chat must be 1-${MC_MAX_LEN} characters`);
-      queueSend(info, text); return;
-    }
-    if (action === 'control') {
-      const allowed = new Set(['forward', 'back', 'left', 'right', 'jump', 'sneak', 'sprint', 'use']);
-      if (!allowed.has(body.control)) throw new Error('Unknown control');
-      mc.setControlState(body.control, body.state !== false); return;
-    }
-    if (action === 'stopControls') { for (const c of ['forward','back','left','right','jump','sneak','sprint','use']) mc.setControlState(c, false); try { mc.deactivateItem(); } catch (_) {} return; }
-    if (action === 'attack') { mc.attack(); return; }
-    if (action === 'useItem') { mc.activateItem(); return; }
-    if (action === 'drop') { mc.tossStack(mc.heldItem); return; }
-    if (action === 'look') { const yaw = Number(body.yaw), pitch = Number(body.pitch); if (!Number.isFinite(yaw) || !Number.isFinite(pitch)) throw new Error('Invalid yaw/pitch'); await mc.look(yaw, Math.max(-Math.PI / 2, Math.min(Math.PI / 2, pitch)), true); return; }
-    if (action === 'slot') { const slot = Number(body.slot); if (!Number.isInteger(slot) || slot < 0 || slot > 8) throw new Error('Invalid hotbar slot'); mc.setQuickBarSlot(slot); return; }
-    if (action === 'afk') { setAfk(info, body.mode, body.intervalMs); return; }
-    if (action === 'autoeat') { info.autoEat = body.enabled !== false; saveData(); return; }
-    if (action === 'login') { const result = applyLoginCmd(info, String(body.command || '')); if (result.error) throw new Error(result.error); return; }
-    throw new Error('Unknown action');
-  },
-});
 if (mcBots.size) {
   const off = [...mcBots.values()].filter(b => !b.autoReconnect).length;
   console.log(`↩️  Restored ${mcBots.size} bot(s)${off ? ` (${off} left disconnected)` : ''}`);
@@ -2480,6 +2566,7 @@ bot.api.setMyCommands([
   { command: 'afk', description: 'Anti-AFK: off | jump | walk | both [interval]' },
   { command: 'setlogin', description: 'Save the login command for a bot' },
   { command: 'console', description: "Open a bot's console" },
+  { command: 'players', description: 'List everyone online on the server' },
   { command: 'click', description: 'Click a slot in an open GUI (captcha)' },
   { command: 'forward', description: 'Forward server chat to this group' },
   { command: 'unforward', description: 'Stop forwarding here' },
