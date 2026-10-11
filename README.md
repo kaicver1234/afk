@@ -500,6 +500,29 @@ On startup, bots that were online are reconnected, and bots you had **disconnect
 
 ---
 
+## Backup & Restore
+
+Move every bot's settings between instances — or keep a safety net before big changes — with two commands (also on the main menu as **Backup** / **Restore**):
+
+| Command | Action |
+|---|---|
+| `/backup` | Sends the full state (bots, saved logins, Neocraft flow, anti-AFK, auto-chat, auto-eat, forwards) as a `mcbackup-….json` document |
+| `/restore` | You attach that file back; its contents are merged into the live state |
+
+Restore merges **per bot name**:
+
+- **The bot exists here** — its backed-up settings are applied; the server it currently points to is **kept** (so you can move a bot to a new server, then restore to re-apply its Neocraft/login/AFK settings without losing the new address)
+- **The bot is gone** — restored in full from the backup
+- A live bot is never disconnected by a restore; bots that are down reconnect automatically, staggered so one server isn't hit all at once
+- Old antibot cooldowns are not replayed (they belong to one IP at one moment)
+- Forwarding subscriptions are merged, never replaced
+
+The restore summary lists every bot that was restored/updated/skipped. The file is validated field-by-field before anything touches the live state, so a corrupted or edited backup degrades to skipped entries, never to a broken manager.
+
+Both commands are **private-chat only** — the backup contains your saved passwords in plain text, exactly like `userdata.json`.
+
+---
+
 ## Via Plugin Support
 
 Server-side Via plugins handle all protocol translation automatically. You just need to specify the correct **client** version when adding a bot:

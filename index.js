@@ -4,6 +4,7 @@ const { Bot, InlineKeyboard } = require('grammy');
 const mineflayer = require('mineflayer');
 const { DEFAULT_FINGERPRINT, isCooldownKick, parseCooldownMs } = require('./antibot');
 const autoEat = require('./autoeat');
+const { validateBackup } = require('./backup');
 const fs = require('fs');
 const net = require('net');
 const os = require('os');
@@ -76,9 +77,11 @@ function writeState(payload) {
   pendingPayload = null;
 }
 
-function saveData() {
-  if (loading) return;
-  const out = {
+// The live state as a plain object. saveData() writes it to disk; /backup
+// sends the same object to the owner as a document so every setting
+// (Neocraft, auto-login, anti-AFK, …) can be replayed later with /restore.
+function collectState() {
+  return {
     bots: [...mcBots.values()].map(b => ({
       name: b.name, host: b.host, port: b.port,
       version: b.version, chatId: b.chatId, ownerUsername: b.ownerUsername,
@@ -102,7 +105,11 @@ function saveData() {
     forwards: Object.fromEntries([...forwardMap].map(([u, s]) => [u, [...s]])),
     active: Object.fromEntries([...activeBot]),
   };
-  const payload = JSON.stringify(out);
+}
+
+function saveData() {
+  if (loading) return;
+  const payload = JSON.stringify(collectState());
   if (payload === savedPayload) { // identical to what's on disk — nothing to do
     if (saveTimer) { clearTimeout(saveTimer); saveTimer = null; }
     pendingPayload = null;
@@ -276,6 +283,7 @@ const stripCodes = s => String(s)
 const RESERVED = new Set([
   'start', 'help', 'forward', 'unforward', 'forwards',
   'cmd', 'say', 'use', 'console', 'bots', 'afk', 'setlogin', 'click', 'where', 'players', 'status',
+  'backup', 'restore',
 ]);
 const MC_MAX_LEN = 256;
 const SEND_GAP_MS = 400;
@@ -524,6 +532,7 @@ function mainMenuText(ctx) {
 const mainMenuKeyboard = () => new InlineKeyboard()
   .text('Add Bot', 'add_bot').text('Bots', 'list_bots').row()
   .text('Commands', 'cmd_help').text('Forwarding', 'fwd_help').row()
+  .text('Backup', 'backup_cmd').text('Restore', 'restore_cmd').row()
   .text('Status', 'status').text('Help', 'help').text('Refresh', 'refresh_menu');
 
 function botListText(ctx) {
@@ -1827,7 +1836,7 @@ bot.command('start', async ctx => {
 });
 
 const HELP_TEXT = () =>
-  `⭐ <b>Help &amp; Usage</b>\n\n<b>➕ Adding a bot</b>\nPress <i>Add Bot</i> then send:\n<code>name  ip  port  [version]</code>\nUse <code>auto</code> as the version to detect the server's own.\n\n<b>Anti-AFK</b> 🏃\nOn a bot's manage screen press <b>Anti-AFK</b>:\n• <b>Jump only</b> — hops in place\n• <b>Walk 1 block</b> — one block forward, one back\n• <b>Jump + Walk</b> — both\nPick any interval from 15s to 30m, or a custom one.\n\n<b>Auto-login</b> 🔐\nPress <b>Set auto-login</b> and send the command your server needs, e.g. <code>/login 1597311</code>. It's saved for that bot and replayed on every reconnect, only when the server asks for it.\n\n<b>Commands</b>\n<code>/bots</code> — list your bots\n<code>/use [name]</code> — pick the bot that runs commands\n<code>/cmd [name] &lt;command&gt;</code> — send a command\n<code>/say &lt;text&gt;</code> — send plain chat\n<code>/click [name] &lt;slot&gt;</code> — click a GUI slot\n<code>/afk [name] &lt;off|jump|walk|both&gt; [interval]</code>\n<code>/setlogin [name] &lt;command&gt;</code>\n<code>/console [name]</code> — open a bot's console\n<code>/players [name]</code> — list everyone on the server\n<code>/status</code> — show host CPU and RAM usage\n<code>/forward @you</code> — forward server chat to a group\n\nAnything else starting with <code>/</code> goes straight to the server.`;
+  `⭐ <b>Help &amp; Usage</b>\n\n<b>➕ Adding a bot</b>\nPress <i>Add Bot</i> then send:\n<code>name  ip  port  [version]</code>\nUse <code>auto</code> as the version to detect the server's own.\n\n<b>Anti-AFK</b> 🏃\nOn a bot's manage screen press <b>Anti-AFK</b>:\n• <b>Jump only</b> — hops in place\n• <b>Walk 1 block</b> — one block forward, one back\n• <b>Jump + Walk</b> — both\nPick any interval from 15s to 30m, or a custom one.\n\n<b>Auto-login</b> 🔐\nPress <b>Set auto-login</b> and send the command your server needs, e.g. <code>/login 1597311</code>. It's saved for that bot and replayed on every reconnect, only when the server asks for it.\n\n<b>Commands</b>\n<code>/bots</code> — list your bots\n<code>/use [name]</code> — pick the bot that runs commands\n<code>/cmd [name] &lt;command&gt;</code> — send a command\n<code>/say &lt;text&gt;</code> — send plain chat\n<code>/click [name] &lt;slot&gt;</code> — click a GUI slot\n<code>/afk [name] &lt;off|jump|walk|both&gt; [interval]</code>\n<code>/setlogin [name] &lt;command&gt;</code>\n<code>/console [name]</code> — open a bot's console\n<code>/players [name]</code> — list everyone on the server\n<code>/status</code> — show host CPU and RAM usage\n<code>/backup</code> — save every bot's settings as a file\n<code>/restore</code> — re-apply a saved backup file\n<code>/forward @you</code> — forward server chat to a group\n\nAnything else starting with <code>/</code> goes straight to the server.`;
 
 bot.command('help', async ctx => {
   await ctx.reply(HELP_TEXT(), {
@@ -2204,6 +2213,240 @@ bot.command('say', async ctx => {
   await relay(ctx, p.info, body.replace(/^\/+/, ''));
 });
 
+// --- backup & restore -------------------------------------------------------
+// /backup sends the exact state-file JSON as a document. /restore takes such a
+// document back and merges it, per bot name:
+//   • the bot exists here  -> backed-up SETTINGS are applied; its current
+//     host/port/version are kept (the user may have moved it on purpose)
+//   • the bot is gone here -> it is restored in full from the backup
+// Live connections are never dropped by a restore; bots that are down and were
+// not paused come back up through the same staggered-start path a restart
+// uses, so restoring many bots can't hammer one server either.
+// Field-level validation lives in backup.js — nothing unsanitised reaches the
+// live Maps.
+const RESTORE_MAX_BYTES = 256 * 1024;
+
+const backupStamp = () => new Date().toISOString().replace(/[:T]/g, '-').slice(0, 16);
+
+// One compact line per bot for the restore summary — settings only, never the
+// saved commands themselves (the file already contains passwords; the chat
+// must not grow more copies of them).
+function featureBits(o) {
+  const bits = [];
+  if (o.ncEnabled && o.ncLogin) bits.push('Neocraft ON');
+  if (o.loginCmd) bits.push(`login ${o.loginEnabled === false ? 'off' : 'saved'}`);
+  if (o.afkMode && o.afkMode !== 'off') bits.push(`AFK ${o.afkMode}/${humanInterval(clampInterval(o.afkIntervalMs || undefined))}`);
+  if (o.autoChatMsg && o.autoChatEnabled !== false) bits.push('auto-chat ON');
+  if (o.autoEat) bits.push('auto-eat ON');
+  return bits.length ? bits.join(' · ') : 'no extras';
+}
+
+async function doBackup(ctx) {
+  if (ctx.chat.type !== 'private') {
+    return ctx.reply('⚠️ Backup is private-chat only — the file contains saved passwords.', {
+      reply_markup: new InlineKeyboard().text('< Back', 'main_menu'),
+    });
+  }
+  const payload = JSON.stringify(collectState(), null, 2);
+  await ctx.replyWithDocument(
+    { source: Buffer.from(payload, 'utf8'), filename: `mcbackup-${backupStamp()}.json` },
+    {
+      caption: `🗃 Backup of ${mcBots.size} bot(s): their servers, saved login commands, Neocraft flow, anti-AFK, auto-chat, auto-eat, plus chat forwards.\n\n` +
+        `Keep it safe — it contains your saved passwords.\n` +
+        `Re-apply any time with /restore (merge per bot name; a bot's current server is kept).`,
+    }
+  );
+}
+
+bot.command('backup', ctx => doBackup(ctx).catch(e => ctx.reply(`❌ Backup failed: <code>${esc(e.message)}</code>`, { parse_mode: 'HTML' })));
+
+const RESTORE_PROMPT =
+  `🔄 <b>Restore a backup</b>\n\n` +
+  `Send the <code>mcbackup-….json</code> file as a document in this chat.\n\n` +
+  `It is merged per bot name:\n` +
+  `• <b>bot exists here</b> — its saved settings are applied; the server it points to now is kept\n` +
+  `• <b>bot is gone</b> — restored in full from the backup\n` +
+  `• a live bot is never disconnected; bots that are down reconnect automatically (staggered)\n` +
+  `• old antibot cooldowns are not replayed\n\n` +
+  `⚠️ Private chat only — the file contains passwords.`;
+
+bot.command('restore', async ctx => {
+  if (ctx.chat.type !== 'private') {
+    return ctx.reply('⚠️ Restore is private-chat only — the file contains saved passwords.');
+  }
+  setState(ctx.chat.id, { action: 'awaiting_restore' });
+  await ctx.reply(RESTORE_PROMPT, {
+    parse_mode: 'HTML',
+    reply_markup: new InlineKeyboard().text('❌ Cancel', 'main_menu'),
+  });
+});
+
+// Merge a validated backup into the live state. See RESTORE_PROMPT for the
+// merge rules; every value in `parsed` has already been sanitised by backup.js.
+async function applyBackup(ctx, parsed) {
+  const chatId = ctx.chat.id;
+  const owner = ctx.from?.username || null;
+  let mineCount = controllableBots(ctx).length;
+  const created = [], updated = [], skipped = [];
+  const pendingStarts = [];
+
+  for (const b of parsed.bots) {
+    // The settings block handed to spawnBot / applied to a live entry.
+    const opts = {
+      loginCmd: b.loginCmd,
+      loginEnabled: b.loginEnabled,
+      ncLogin: b.ncLogin, ncSecond: b.ncSecond, ncThird: b.ncThird, ncEnabled: b.ncEnabled,
+      afkMode: b.afkMode,
+      afkIntervalMs: b.afkIntervalMs != null ? clampInterval(b.afkIntervalMs) : undefined,
+      autoChatMsg: b.autoChatMsg,
+      autoChatEnabled: b.autoChatEnabled,
+      autoChatIntervalMs: b.autoChatIntervalMs != null ? clampChatInterval(b.autoChatIntervalMs) : undefined,
+      autoEat: b.autoEat,
+    };
+
+    const existing = mcBots.get(b.name);
+    if (existing) {
+      if (!canControl(ctx, existing)) { skipped.push(`${b.name} — owned by someone else`); continue; }
+
+      const wasNc = existing.ncEnabled === true;
+      // Backed-up settings win; the server it points to now is kept.
+      existing.loginCmd = opts.loginCmd; existing.loginEnabled = opts.loginEnabled;
+      existing.ncLogin = opts.ncLogin; existing.ncSecond = opts.ncSecond; existing.ncThird = opts.ncThird;
+      existing.ncEnabled = opts.ncEnabled;
+      existing.afkMode = opts.afkMode;
+      if (opts.afkIntervalMs !== undefined) existing.afkIntervalMs = opts.afkIntervalMs;
+      existing.autoChatMsg = opts.autoChatMsg; existing.autoChatEnabled = opts.autoChatEnabled;
+      if (opts.autoChatIntervalMs !== undefined) existing.autoChatIntervalMs = opts.autoChatIntervalMs;
+      existing.autoEat = opts.autoEat;
+
+      const server = `${existing.host}:${existing.port}`;
+      if (existing.status === 'online' && existing.mcBot) {
+        // Re-arm the loops that were scheduled with the old settings.
+        stopLogin(existing);
+        stopAfk(existing);
+        scheduleAfk(existing);
+        stopAutoChat(existing);
+        if (existing.autoChatMsg && existing.autoChatEnabled !== false) scheduleAutoChat(existing);
+        if (opts.ncEnabled && !wasNc) scheduleNeocraft(existing);
+        updated.push(`${b.name} — settings applied (server kept ${server}, bot stays online)`);
+      } else if (existing.status === 'connecting') {
+        updated.push(`${b.name} — settings applied (it is connecting now; new settings take effect on its next join)`);
+      } else if (!b.paused) {
+        pendingStarts.push({ b: { name: existing.name, host: existing.host, port: existing.port, version: existing.version, chatId: existing.chatId, ownerUsername: existing.ownerUsername }, opts });
+        updated.push(`${b.name} — settings applied, reconnecting (server kept ${server})`);
+      } else {
+        existing.autoReconnect = false; // the backup says paused — leave it down
+        updated.push(`${b.name} — settings applied, left offline (paused in backup)`);
+      }
+    } else {
+      if (mineCount >= MAX_BOTS_PER_OWNER) { skipped.push(`${b.name} — bot limit reached`); continue; }
+      mineCount++;
+      const entry = {
+        name: b.name, host: b.host, port: b.port, version: b.version,
+        chatId, ownerUsername: owner,
+        mcBot: null, status: 'offline', connectedAt: null,
+        error: b.paused ? 'Restored from backup (paused)' : 'Restored from backup',
+        autoReconnect: false, reconnectAttempts: 0, reconnectTimer: null,
+        cooldownUntil: 0, cooldownWaits: 0,
+        ...opts,
+      };
+      mcBots.set(b.name, entry);
+      if (b.paused) {
+        created.push(`${b.name} — ${b.host}:${b.port} · ${featureBits(opts)} · paused`);
+      } else {
+        pendingStarts.push({ b: { name: b.name, host: b.host, port: b.port, version: b.version, chatId, ownerUsername: owner }, opts });
+        created.push(`${b.name} — ${b.host}:${b.port} · ${featureBits(opts)} · connecting`);
+      }
+    }
+  }
+
+  // Forwarding subscriptions — merged, never replaced: a group that never
+  // subscribed stays unsubscribed.
+  let fwd = 0;
+  for (const [u, ids] of Object.entries(parsed.forwards)) {
+    if (!forwardMap.has(u)) forwardMap.set(u, new Set());
+    const set = forwardMap.get(u);
+    for (const id of ids) { set.add(id); fwd++; }
+  }
+
+  // Active picks — only for bots that actually exist after the merge, and
+  // never overwriting a pick made in this chat after the backup was taken.
+  let act = 0;
+  for (const [cid, nm] of Object.entries(parsed.active)) {
+    const id = Number(cid);
+    if (mcBots.has(nm) && !activeBot.has(id)) { activeBot.set(id, nm); act++; }
+  }
+
+  saveData();
+  // Same staggered-start path a process restart uses: the first bot connects
+  // right away, the rest wait their slot so one server isn't hit all at once.
+  scheduleStaggeredStarts(pendingStarts);
+
+  const L = [`✅ <b>Backup applied</b>${parsed.skipped ? ` — ${parsed.skipped} invalid entr${parsed.skipped === 1 ? 'y' : 'ies'} skipped` : ''}`];
+  if (created.length) L.push('', `<b>Restored (${created.length}):</b>`, ...created.map(x => `📥 ${esc(x)}`));
+  if (updated.length) L.push('', `<b>Updated (${updated.length}):</b>`, ...updated.map(x => `🔄 ${esc(x)}`));
+  if (skipped.length) L.push('', `<b>Skipped (${skipped.length}):</b>`, ...skipped.map(x => `⛔ ${esc(x)}`));
+  const tail = [];
+  if (fwd) tail.push(`📡 ${fwd} forwarding subscription(s) merged.`);
+  if (act) tail.push(`📍 ${act} active-bot pick(s) restored.`);
+  tail.push(`${mcBots.size} bot(s) now registered.`);
+  L.push('', tail.join('\n'), '\n<i>Press a bot in Bots to manage it.</i>');
+  await ctx.reply(L.join('\n'), {
+    parse_mode: 'HTML',
+    reply_markup: new InlineKeyboard().text('📋 Bots', 'list_bots').text('< Back', 'main_menu'),
+  });
+}
+
+bot.on('message:document', async ctx => {
+  const chatId = ctx.chat.id;
+  const state = getState(chatId);
+  const doc = ctx.message.document;
+
+  if (state?.action !== 'awaiting_restore') {
+    // A backup file out of nowhere — point at /restore instead of ignoring it.
+    if (ctx.chat.type === 'private' && typeof doc.file_name === 'string' && /\.json$/i.test(doc.file_name)) {
+      await ctx.reply('📥 Looks like a backup file — send /restore first, then attach it again.', {
+        reply_markup: new InlineKeyboard().text('🔄 Restore', 'restore_cmd'),
+      });
+    }
+    return;
+  }
+
+  if (doc.file_size && doc.file_size > RESTORE_MAX_BYTES) {
+    return ctx.reply(`❌ That file is too big for a backup (max ${RESTORE_MAX_BYTES / 1024} KB).`, {
+      reply_markup: new InlineKeyboard().text('❌ Cancel', 'main_menu'),
+    });
+  }
+
+  let parsed;
+  try {
+    // grammy in this version has no downloadFile helper — pull the file
+    // straight from Telegram. The URL embeds the bot token, so it is never
+    // logged or echoed anywhere.
+    const f = await bot.api.getFile(doc.file_id);
+    if (!f?.file_path) throw new Error('Telegram returned no file path');
+    const res = await fetch(`https://api.telegram.org/file/bot${TOKEN}/${f.file_path}`);
+    if (!res.ok) throw new Error(`download failed (HTTP ${res.status})`);
+    const buf = Buffer.from(await res.arrayBuffer());
+    if (buf.length > RESTORE_MAX_BYTES) {
+      return ctx.reply(`❌ That file is too big for a backup (max ${RESTORE_MAX_BYTES / 1024} KB).`);
+    }
+    parsed = validateBackup(buf.toString('utf8'));
+  } catch (e) {
+    return ctx.reply(`❌ Could not read the file: <code>${esc(e.message)}</code>`, { parse_mode: 'HTML' });
+  }
+
+  if (!parsed.ok) {
+    return ctx.reply(`❌ ${esc(parsed.error)}`, {
+      parse_mode: 'HTML',
+      reply_markup: new InlineKeyboard().text('❌ Cancel', 'main_menu'),
+    });
+  }
+
+  chatStates.delete(chatId);
+  await applyBackup(ctx, parsed).catch(e => ctx.reply(`❌ Restore failed: <code>${esc(e.message)}</code>`, { parse_mode: 'HTML' }));
+});
+
 bot.on('callback_query:data', async ctx => {
   const data = ctx.callbackQuery.data;
   const chatId = ctx.chat.id;
@@ -2265,6 +2508,19 @@ bot.on('callback_query:data', async ctx => {
       new InlineKeyboard().text('❌ Cancel', 'main_menu')
     );
     return answer('✏️ Type the bot details in chat!');
+  }
+
+  if (data === 'backup_cmd') {
+    answer();
+    await doBackup(ctx).catch(e => ctx.reply(`❌ Backup failed: <code>${esc(e.message)}</code>`, { parse_mode: 'HTML' }));
+    return;
+  }
+
+  if (data === 'restore_cmd') {
+    if (ctx.chat.type !== 'private') return answer('Restore is private-chat only.');
+    setState(chatId, { action: 'awaiting_restore' });
+    await edit(RESTORE_PROMPT, new InlineKeyboard().text('❌ Cancel', 'main_menu'));
+    return answer('Send the backup file');
   }
 
   // Everything below acts on one named bot — resolve and authorize once.
@@ -2904,6 +3160,8 @@ bot.api.setMyCommands([
   { command: 'players', description: 'List everyone online on the server' },
   { command: 'status', description: 'Show host CPU and RAM usage' },
   { command: 'click', description: 'Click a slot in an open GUI (captcha)' },
+  { command: 'backup', description: "Save every bot's settings as a file" },
+  { command: 'restore', description: 'Re-apply a saved backup file' },
   { command: 'forward', description: 'Forward server chat to this group' },
   { command: 'unforward', description: 'Stop forwarding here' },
   { command: 'forwards', description: 'List active forwards' },
