@@ -6,6 +6,7 @@ const { DEFAULT_FINGERPRINT, isCooldownKick, parseCooldownMs } = require('./anti
 const autoEat = require('./autoeat');
 const fs = require('fs');
 const net = require('net');
+const os = require('os');
 const path = require('path');
 const v8 = require('v8');
 
@@ -129,6 +130,10 @@ function loadData() {
     const raw = JSON.parse(fs.readFileSync(DATA, 'utf8'));
     for (const [u, ids] of Object.entries(raw.forwards || {})) forwardMap.set(u, new Set(ids));
     for (const [chatId, name] of Object.entries(raw.active || {})) activeBot.set(Number(chatId), name);
+    // Collected first, dialed out after the loop so joins to one server can be
+    // staggered (see scheduleStaggeredStarts/scheduleStaggeredCooldowns).
+    const pendingStarts = [];
+    const pendingCooldowns = [];
     for (const b of (raw.bots || [])) {
       // One corrupt record must not cost us every other bot's restoration.
       try {
@@ -172,20 +177,20 @@ function loadData() {
             ...opts,
           };
           mcBots.set(b.name, entry);
-          entry.reconnectTimer = setTimeout(() => {
-            const latest = mcBots.get(b.name);
-            if (latest !== entry || !entry.autoReconnect) return;
-            entry.cooldownUntil = 0;
-            spawnBot(b.name, b.host, b.port, b.version, b.chatId, b.ownerUsername, opts);
-          }, delay);
-          if (entry.reconnectTimer.unref) entry.reconnectTimer.unref();
+          pendingCooldowns.push({ entry, b, opts, delay });
         } else {
-          spawnBot(b.name, b.host, b.port, b.version, b.chatId, b.ownerUsername, opts);
+          pendingStarts.push({ b, opts });
         }
       } catch (e) {
         console.error(`loadData: skipping bot ${JSON.stringify(b && b.name)} — ${e.message}`);
       }
     }
+    // Staggered startup: bots sharing one server never dial out at once — the
+    // first (by name) connects right away, the rest wait their slot. Without
+    // this, a process restart rejoins every bot in the same tick and hammers a
+    // freshly restarted server into rate-limiting the IP.
+    scheduleStaggeredStarts(pendingStarts);
+    scheduleStaggeredCooldowns(pendingCooldowns);
   } catch (e) { console.error('loadData:', e.message); }
   loading = false;
 }
@@ -270,7 +275,7 @@ const stripCodes = s => String(s)
 // Telegram commands owned by this bot — never relayed to Minecraft.
 const RESERVED = new Set([
   'start', 'help', 'forward', 'unforward', 'forwards',
-  'cmd', 'say', 'use', 'console', 'bots', 'afk', 'setlogin', 'click', 'where', 'players',
+  'cmd', 'say', 'use', 'console', 'bots', 'afk', 'setlogin', 'click', 'where', 'players', 'status',
 ]);
 const MC_MAX_LEN = 256;
 const SEND_GAP_MS = 400;
@@ -348,7 +353,7 @@ function parseChatInterval(raw) {
 // --- auto-login ---
 // Servers running AuthMe/nLogin ask for /login after every join. We replay the
 // saved command when the server prompts, and once as a fallback if it never does.
-const LOGIN_PROMPT_RE = /\b(login|log in|logg?ed in|register|authenticat|password|senha|contrase|войти|парол)/i;
+const LOGIN_PROMPT_RE = /\b(login|log in|logg?ed in|register|authenticat|password|ramz|senha|contrase|войти|парол)/i;
 const LOGIN_OK_RE = /\b(logged in|login success|successfully logged|authenticated|welcome back|already logged)/i;
 const LOGIN_FALLBACK_MS = 4000;
 const LOGIN_MAX_TRIES = 3;
@@ -519,7 +524,7 @@ function mainMenuText(ctx) {
 const mainMenuKeyboard = () => new InlineKeyboard()
   .text('Add Bot', 'add_bot').text('Bots', 'list_bots').row()
   .text('Commands', 'cmd_help').text('Forwarding', 'fwd_help').row()
-  .text('Help', 'help').text('Refresh', 'refresh_menu');
+  .text('Status', 'status').text('Help', 'help').text('Refresh', 'refresh_menu');
 
 function botListText(ctx) {
   const mine = controllableBots(ctx);
@@ -674,7 +679,7 @@ function neocraftMenuText(b) {
   const login = b.ncLogin ? `<code>${esc(maskLogin(b.ncLogin))}</code>` : '<i>not set</i>';
   const second = b.ncSecond ? `<code>${esc(b.ncSecond)}</code>` : '<i>not set</i>';
   const third = b.ncThird ? `<code>${esc(b.ncThird)}</code>` : '<i>not set</i>';
-  return `<b>Neocraft server - ${esc(b.name)}</b>\n\nOn every join it logs in, switches you into survival, then runs a 3rd command 5 minutes later.\n\n<b>Login command:</b> ${login}\n<b>2nd command:</b> ${second}\n<b>3rd command (after 5 min):</b> ${third}\n<b>Status:</b> ${status}\n\nTiming: login ~2s after joining, 2nd command 10s after that, 3rd command 5 minutes after the 2nd.\nRuns once per connection and announces each step here.`;
+  return `<b>Neocraft server - ${esc(b.name)}</b>\n\nOn every join it logs in, switches you into survival, then runs a 3rd command 5 minutes later.\n\n<b>Login command:</b> ${login}\n<b>2nd command:</b> ${second}\n<b>3rd command (after 5 min):</b> ${third}\n<b>Status:</b> ${status}\n\nLogin answers the server's own prompt (fallback ~2s after joining, retried up to 3x while unconfirmed). The 2nd command goes out ~3s after login is confirmed and repeats once more ~15s later for assurance; the 3rd runs 5 minutes after the 2nd.\nThe whole chain re-runs on every join and announces each step here.`;
 }
 
 function neocraftMenuKeyboard(name) {
@@ -746,8 +751,13 @@ function stopLogin(info) {
 function stopNeocraft(info) {
   if (info.ncTimer1) { clearTimeout(info.ncTimer1); info.ncTimer1 = null; }
   if (info.ncTimer2) { clearTimeout(info.ncTimer2); info.ncTimer2 = null; }
+  if (info.ncTimer2b) { clearTimeout(info.ncTimer2b); info.ncTimer2b = null; }
   if (info.ncTimer3) { clearTimeout(info.ncTimer3); info.ncTimer3 = null; }
-  info.ncFlowDone = false;
+  if (info.ncLoginRetryTimer) { clearTimeout(info.ncLoginRetryTimer); info.ncLoginRetryTimer = null; }
+  info.ncLoginTries = 0;
+  info.ncLoginDone = false;
+  info.ncSecondSends = 0;
+  info.ncSurvivalDone = false;
 }
 
 function destroyBot(info) {
@@ -911,55 +921,159 @@ function sendLogin(info, why) {
 }
 
 // --- neocraft timing ---
-const NC_LOGIN_DELAY_MS = 2000;        // login command this long after joining
-const NC_SECOND_DELAY_MS = 10000;      // 2nd command this long after the login
+const NC_LOGIN_DELAY_MS = 2000;        // join fallback: send login if the server never prompts
+const NC_LOGIN_RETRY_MS = 8000;        // resend login while the server hasn't confirmed it
+const NC_LOGIN_MAX_TRIES = 3;          // login attempts per connection before giving up
+const NC_AFTER_LOGIN_MS = 3000;        // 2nd command this soon after the server confirms login
+const NC_SECOND_DELAY_MS = 10000;      // fallback: 2nd command this long after login if never confirmed
+const NC_SECOND_RESEND_MS = 15000;     // gap between 2nd-command repeats while unconfirmed
+const NC_SECOND_MAX_TRIES = 4;         // stop repeating the 2nd command after this many sends
 const NC_THIRD_DELAY_MS = 5 * 60000;   // 3rd command 5 minutes after the 2nd (or the login if no 2nd)
 
+// Neocraft's real chat lines are Finglish. The prompt asks for /login; success is
+// "Dar hal-e enteghal be Lobby..." plus a small-caps "WELCOME ... NEOCRAFT"
+// banner. "Khosh bargashti" is printed BOTH before and after login, so it must
+// never count as a confirmation. /survival is confirmed by "Connecting to Survival..".
+const NC_LOGGED_IN_RE = /(dar hal[-\s]?e enteghal|enteghal be lobby|(ᴡᴇʟᴄᴏᴍᴇ|welcome)[\s\S]{0,40}neocraft)/i;
+const NC_SURVIVAL_OK_RE = /connecting to[\s\S]{0,30}survival|survival[\s\S]{0,30}(connected|joined)|switched to survival/i;
+
 // Neocraft server auto-flow: log in, switch into survival, then run a 3rd
-// command after 5 minutes. Runs at most once per connection — a dimension
-// change re-emits 'spawn' and must not replay /login (and would otherwise loop
-// when the 2nd command swaps worlds).
-function sendNcFlow(info) {
-  if (info.status !== 'online' || !info.mcBot) return;
-  if (info.ncFlowDone) return;
-  info.ncFlowDone = true;
+// command after 5 minutes. The login reacts to the server's own prompt (with a
+// join fallback + retries while it stays unconfirmed); the 2nd command goes out
+// once login is confirmed (with a timed fallback for silent servers) and is
+// repeated once more for assurance, in case the first one landed while the
+// server was still moving the player into the lobby. A fresh join re-arms the
+// whole chain, so a bot that falls out and lands back in the lobby logs in and
+// re-runs the 2nd command by itself.
+function sendNcLogin(info, why) {
+  if (!info.ncEnabled || !info.ncLogin) return false;
+  if (info.ncLoginDone) return false;
+  if (info.status !== 'online' || !info.mcBot) return false;
+  if ((info.ncLoginTries || 0) >= NC_LOGIN_MAX_TRIES) return false;
+  info.ncLoginTries = (info.ncLoginTries || 0) + 1;
+  // The join fallback has served its purpose once we send for any reason.
+  if (info.ncTimer1) { clearTimeout(info.ncTimer1); info.ncTimer1 = null; }
   queueSend(info, info.ncLogin, true);
-  info.error = 'Neocraft login sent';
-  notify(info.chatId, `🏰 <b>${esc(info.name)}</b> — login sent (<code>${esc(maskLogin(info.ncLogin))}</code>); <code>${esc(info.ncSecond || '')}</code> follows in ${NC_SECOND_DELAY_MS / 1000}s.`);
-  const armThird = from => {
-    if (!info.ncThird) return;
-    info.ncTimer3 = setTimeout(() => {
-      info.ncTimer3 = null;
-      if (info.status !== 'online' || !info.mcBot) return;
-      queueSend(info, info.ncThird);
-      info.error = 'Neocraft 3rd command sent';
-      notify(info.chatId, `🏰 <b>${esc(info.name)}</b> — 3rd command sent: <code>${esc(info.ncThird)}</code>`);
-    }, NC_THIRD_DELAY_MS - (Date.now() - from));
-  };
-  if (info.ncSecond) {
+  info.error = `Neocraft login sent (${why}, try ${info.ncLoginTries})`;
+  if (info.ncLoginTries === 1) {
+    notify(info.chatId, `🏰 <b>${esc(info.name)}</b> — login sent (<code>${esc(maskLogin(info.ncLogin))}</code>)${info.ncSecond ? `; <code>${esc(info.ncSecond)}</code> follows after login.` : ''}`);
+  } else {
+    console.log(`[${info.name}] Neocraft login retry ${info.ncLoginTries} (${why})`);
+  }
+
+  // The server hasn't confirmed yet — keep retrying while it keeps asking.
+  if (info.ncLoginRetryTimer) clearTimeout(info.ncLoginRetryTimer);
+  info.ncLoginRetryTimer = setTimeout(() => {
+    info.ncLoginRetryTimer = null;
+    if (info.ncLoginDone) return;
+    if (mcBots.get(info.name) !== info) return;
+    sendNcLogin(info, 'retry');
+  }, NC_LOGIN_RETRY_MS);
+
+  // Fallback: some servers never send a recognizable "logged in" line.
+  // If confirmation never comes, still send the 2nd command on a timer.
+  if (info.ncSecond && !info.ncSecondSends && !info.ncTimer2) {
     info.ncTimer2 = setTimeout(() => {
       info.ncTimer2 = null;
-      if (info.status !== 'online' || !info.mcBot) return;
-      queueSend(info, info.ncSecond);
-      info.error = 'Neocraft 2nd command sent';
-      notify(info.chatId, `🏰 <b>${esc(info.name)}</b> — 2nd command sent: <code>${esc(info.ncSecond)}</code>${info.ncThird ? `; <code>${esc(info.ncThird)}</code> follows in ${NC_THIRD_DELAY_MS / 60000} min.` : ''}`);
-      armThird(Date.now());
+      if (mcBots.get(info.name) !== info) return;
+      if (info.ncSecondSends) return;
+      sendNcSecond(info, 'fallback');
     }, NC_SECOND_DELAY_MS);
-  } else {
-    armThird(Date.now());
+  } else if (!info.ncSecond && !info.ncTimer3) {
+    armNcThird(info, Date.now());
   }
+  return true;
+}
+
+// The server confirmed the login — stop retrying it and send the 2nd command
+// after a short pause so the server finishes dropping the player into the lobby.
+function onNcLoginConfirmed(info) {
+  if (!info.ncEnabled || !info.ncLogin) return;
+  if (info.ncLoginDone) return;
+  info.ncLoginDone = true;
+  if (info.ncLoginRetryTimer) { clearTimeout(info.ncLoginRetryTimer); info.ncLoginRetryTimer = null; }
+  if (info.ncTimer1) { clearTimeout(info.ncTimer1); info.ncTimer1 = null; }
+  info.error = 'Neocraft login confirmed';
+  if (!info.ncSecond) {
+    if (!info.ncTimer3) armNcThird(info, Date.now());
+    return;
+  }
+  if (info.ncSecondSends) return; // the fallback already sent it; its resend is armed
+  if (info.ncTimer2) clearTimeout(info.ncTimer2);
+  info.ncTimer2 = setTimeout(() => {
+    info.ncTimer2 = null;
+    if (mcBots.get(info.name) !== info) return;
+    if (info.ncSecondSends) return;
+    sendNcSecond(info, 'after login');
+  }, NC_AFTER_LOGIN_MS);
+}
+
+function sendNcSecond(info, why) {
+  if (!info.ncEnabled || !info.ncSecond) return false;
+  if (info.ncSurvivalDone) return false;
+  if (info.status !== 'online' || !info.mcBot) return false;
+  if ((info.ncSecondSends || 0) >= NC_SECOND_MAX_TRIES) return false;
+  queueSend(info, info.ncSecond);
+  info.ncSecondSends = (info.ncSecondSends || 0) + 1;
+  info.error = `Neocraft 2nd command sent (${why}, try ${info.ncSecondSends})`;
+  if (info.ncSecondSends === 1) {
+    notify(info.chatId, `🏰 <b>${esc(info.name)}</b> — 2nd command sent (${why}): <code>${esc(info.ncSecond)}</code>${info.ncThird ? `; <code>${esc(info.ncThird)}</code> follows in ${NC_THIRD_DELAY_MS / 60000} min.` : ''}`);
+    armNcThird(info, Date.now());
+  } else {
+    console.log(`[${info.name}] Neocraft 2nd command resend ${info.ncSecondSends} (${why})`);
+  }
+  // Keep repeating until the server answers with "Connecting to Survival..".
+  // A command that lands while the lobby is still moving the player gets lost,
+  // so one blind send is not enough.
+  if (info.ncTimer2b) clearTimeout(info.ncTimer2b);
+  info.ncTimer2b = setTimeout(() => {
+    info.ncTimer2b = null;
+    if (mcBots.get(info.name) !== info) return;
+    if (info.ncSurvivalDone) return;
+    sendNcSecond(info, 'assurance resend');
+  }, NC_SECOND_RESEND_MS);
+  return true;
+}
+
+// The server answered the 2nd command — stop repeating it.
+function onNcSurvivalConfirmed(info) {
+  if (!info.ncEnabled || !info.ncSecond) return;
+  if (info.ncSurvivalDone) return;
+  info.ncSurvivalDone = true;
+  if (info.ncTimer2) { clearTimeout(info.ncTimer2); info.ncTimer2 = null; }
+  if (info.ncTimer2b) { clearTimeout(info.ncTimer2b); info.ncTimer2b = null; }
+  info.error = 'Neocraft survival confirmed';
+  notify(info.chatId, `🏰 <b>${esc(info.name)}</b> — in Survival, stopping repeats.`);
+}
+
+function armNcThird(info, from) {
+  if (!info.ncThird) return;
+  if (info.ncTimer3) clearTimeout(info.ncTimer3);
+  const wait = Math.max(0, NC_THIRD_DELAY_MS - (Date.now() - (from || Date.now())));
+  info.ncTimer3 = setTimeout(() => {
+    info.ncTimer3 = null;
+    if (mcBots.get(info.name) !== info) return;
+    if (info.status !== 'online' || !info.mcBot) return;
+    queueSend(info, info.ncThird);
+    info.error = 'Neocraft 3rd command sent';
+    notify(info.chatId, `🏰 <b>${esc(info.name)}</b> — 3rd command sent: <code>${esc(info.ncThird)}</code>`);
+  }, wait);
 }
 
 function scheduleNeocraft(info) {
   if (!info.ncEnabled || !info.ncLogin) return;
-  if (info.ncFlowDone) return;
+  if (info.ncLoginDone || (info.ncLoginTries || 0) > 0) {
+    // The login phase already ran (e.g. the 3rd command was added mid-session):
+    // just make sure it gets armed if it now exists.
+    if (info.ncThird && !info.ncTimer3 && (!info.ncSecond || info.ncSecondSends)) armNcThird(info, Date.now());
+    return;
+  }
   if (info.ncTimer1) clearTimeout(info.ncTimer1);
-  if (info.ncTimer2) clearTimeout(info.ncTimer2);
-  if (info.ncTimer3) clearTimeout(info.ncTimer3);
   info.ncTimer1 = setTimeout(() => {
     info.ncTimer1 = null;
+    if (mcBots.get(info.name) !== info) return;
     if (info.status !== 'online' || !info.mcBot) return;
-    sendNcFlow(info);
+    sendNcLogin(info, 'fallback');
   }, NC_LOGIN_DELAY_MS);
 }
 
@@ -974,10 +1088,17 @@ function scheduleNeocraft(info) {
 const PROBE_CHECK_MS = 30000;   // cadence of the inbound-activity check
 const PROBE_SILENCE_MS = 25000; // inbound quiet longer than this ⇒ open a probe
 const PROBE_DEAD_MS = 10000;          // 10s of stalls = the path is dead, not lag
-const PROBE_SOCKET_TIMEOUT_MS = 8000;
+// Must stay ABOVE PROBE_DEAD_MS: a stalled connect is cut by this socket timeout,
+// and the error handler only treats an error as "dead path" once PROBE_DEAD_MS
+// has elapsed since the probe started. With the timeout below the threshold
+// (it was 8s vs 10s), a blackholed path was always silently closed as "too fast
+// to judge" and the dead-path branch could never fire.
+const PROBE_SOCKET_TIMEOUT_MS = 12000;
 // Fixed reconnect interval (user preference): always retry after ~4s instead of
 // escalating the backoff. A tiny jitter keeps retries off a perfect beat so the
-// pattern doesn't look automated, but the gap stays at ~4s on every attempt.
+// pattern doesn't look automated. When several bots share one server,
+// staggerExtraMs() adds a per-bot slot on top (see below) — a lone bot still
+// rejoins on the plain ~4s beat.
 const RECONNECT_FIXED_MS = 4000;
 const RECONNECT_FIXED_JITTER = 1000;
 const reconnectDelay = n =>
@@ -992,6 +1113,123 @@ const isTimeoutError = e =>
 // cooldown message) gets retried on a steady beat forever instead of the bot
 // parking itself for long stretches between tries.
 const retryDelay = (n, timeout) => reconnectDelay(n);
+
+// Staggered rejoins after a mass drop. When a server restarts, every bot on it
+// falls out at once; retrying all of them on the same ~4s beat hammers the
+// server the moment it comes back and can trip its rate limit. So when other
+// bots on the same host:port are also down and set to retry, each bot waits its
+// own slot on top of the normal delay. The slot is the bot's index in the
+// sorted names of the down group, so it is stable across retry rounds with no
+// shared ledger that could go stale and park a lone bot behind dead entries.
+const STAGGER_SLOT_MS = 7000;
+const STAGGER_JITTER_MS = 3000;
+
+function staggerExtraMs(host, port, name) {
+  const h = String(host).toLowerCase();
+  const downNames = [];
+  for (const b of mcBots.values()) {
+    if (b.name === name) continue; // self is always counted below
+    if (String(b.host).toLowerCase() !== h || Number(b.port) !== Number(port)) continue;
+    if (b.status === 'online') continue;
+    if (!b.autoReconnect) continue; // parked by the user — not rejoining
+    if (b.status === 'error' && !b.reconnectTimer) continue; // gave up — not rejoining
+    downNames.push(b.name);
+  }
+  downNames.push(name); // this bot is rejoining — it always holds a slot
+  if (downNames.length < 2) return 0; // just us — keep the plain ~4s beat
+  downNames.sort();
+  const slot = downNames.indexOf(name);
+  return slot * STAGGER_SLOT_MS + Math.floor(Math.random() * STAGGER_JITTER_MS);
+}
+
+// Group startup joins by server so a process restart never dials out to one
+// server from every bot in the same tick. The first bot (by name) connects
+// right away; the rest wait their slot. Placeholders with status 'offline' keep
+// the bots visible (and manually reconnectable) during the wait.
+function scheduleStaggeredStarts(list) {
+  const byServer = new Map();
+  for (const p of list) {
+    const key = `${String(p.b.host).toLowerCase()}:${p.b.port}`;
+    if (!byServer.has(key)) byServer.set(key, []);
+    byServer.get(key).push(p);
+  }
+  for (const group of byServer.values()) {
+    // Plain code-unit sort — the same ordering staggerExtraMs() uses, so the
+    // startup slot order matches the retry slot order for the same bot set.
+    group.sort((a, b) => (String(a.b.name) < String(b.b.name) ? -1 : String(a.b.name) > String(b.b.name) ? 1 : 0));
+    if (group.length > 1) console.log(`[stagger] ${group.length} bots on ${String(group[0].b.host).toLowerCase()}:${group[0].b.port} — spreading startup joins`);
+    group.forEach((p, i) => {
+      const { b, opts } = p;
+      if (i === 0) {
+        spawnBot(b.name, b.host, b.port, b.version, b.chatId, b.ownerUsername, opts);
+        return;
+      }
+      const wait = i * STAGGER_SLOT_MS + Math.floor(Math.random() * STAGGER_JITTER_MS);
+      const entry = {
+        name: b.name, host: b.host, port: b.port, version: b.version,
+        chatId: b.chatId, ownerUsername: b.ownerUsername || null,
+        mcBot: null, status: 'offline',
+        connectedAt: null, error: `Starting in ${Math.round(wait / 1000)}s (staggered rejoin with ${group.length} bots on this server)`,
+        autoReconnect: true, reconnectAttempts: 0, reconnectTimer: null,
+        cooldownUntil: 0, cooldownWaits: Number(b.cooldownWaits) || 0,
+        ...opts,
+      };
+      mcBots.set(b.name, entry);
+      entry.reconnectTimer = setTimeout(() => {
+        const latest = mcBots.get(b.name);
+        if (latest !== entry || !entry.autoReconnect) return;
+        entry.reconnectTimer = null;
+        // Read the live entry, not the startup snapshot: the user may have
+        // changed settings (AFK, login, auto-chat…) while waiting for the slot.
+        spawnBot(b.name, b.host, b.port, b.version, b.chatId, b.ownerUsername, {
+          loginCmd: entry.loginCmd, loginEnabled: entry.loginEnabled,
+          ncLogin: entry.ncLogin, ncSecond: entry.ncSecond, ncThird: entry.ncThird, ncEnabled: entry.ncEnabled,
+          afkMode: entry.afkMode, afkIntervalMs: entry.afkIntervalMs,
+          autoChatMsg: entry.autoChatMsg, autoChatEnabled: entry.autoChatEnabled, autoChatIntervalMs: entry.autoChatIntervalMs,
+          autoEat: entry.autoEat,
+        });
+      }, wait);
+      if (entry.reconnectTimer.unref) entry.reconnectTimer.unref();
+    });
+  }
+}
+
+// Same staggering for joins that were parked behind an antibot cooldown across
+// a restart: without it, bots that share one IP's cooldown all rejoin in the
+// same tick when it expires.
+function scheduleStaggeredCooldowns(list) {
+  const byServer = new Map();
+  for (const p of list) {
+    const key = `${String(p.b.host).toLowerCase()}:${p.b.port}`;
+    if (!byServer.has(key)) byServer.set(key, []);
+    byServer.get(key).push(p);
+  }
+  for (const group of byServer.values()) {
+    group.sort((a, b) => (String(a.entry.name) < String(b.entry.name) ? -1 : String(a.entry.name) > String(b.entry.name) ? 1 : 0));
+    group.forEach((p, i) => {
+      const extra = i === 0 ? 0 : i * STAGGER_SLOT_MS + Math.floor(Math.random() * STAGGER_JITTER_MS);
+      const total = p.delay + extra;
+      if (extra > 0) p.entry.error = `Antibot cooldown — waiting ${humanInterval(total)} (incl. staggered rejoin)`;
+      p.entry.reconnectTimer = setTimeout(() => {
+        const latest = mcBots.get(p.b.name);
+        if (latest !== p.entry || !p.entry.autoReconnect) return;
+        p.entry.reconnectTimer = null;
+        p.entry.cooldownUntil = 0;
+        // Read the live entry, not the startup snapshot: the user may have
+        // changed settings while parked behind the cooldown.
+        const e = p.entry;
+        spawnBot(p.b.name, p.b.host, p.b.port, p.b.version, p.b.chatId, p.b.ownerUsername, {
+          loginCmd: e.loginCmd, loginEnabled: e.loginEnabled,
+          ncLogin: e.ncLogin, ncSecond: e.ncSecond, ncThird: e.ncThird, ncEnabled: e.ncEnabled,
+          afkMode: e.afkMode, afkIntervalMs: e.afkIntervalMs,
+          autoChatMsg: e.autoChatMsg, autoChatEnabled: e.autoChatEnabled, autoChatIntervalMs: e.autoChatIntervalMs,
+          autoEat: e.autoEat,
+        });
+      }, total);
+      if (p.entry.reconnectTimer.unref) p.entry.reconnectTimer.unref();
+    });
+  }
+}
 
 // Half-open socket guardian. While a bot is "online" we probe the outbound TCP
 // path to its server once a minute or so; if the path is dead (host asleep, NAT
@@ -1060,7 +1298,8 @@ async function spawnBot(name, host, port, version, chatId, ownerUsername, opts =
     ncSecond: opts.ncSecond !== undefined ? opts.ncSecond : (ex?.ncSecond ?? null),
     ncThird: opts.ncThird !== undefined ? opts.ncThird : (ex?.ncThird ?? null),
     ncEnabled: opts.ncEnabled !== undefined ? opts.ncEnabled : (ex?.ncEnabled === true),
-    ncTimer1: null, ncTimer2: null, ncTimer3: null, ncFlowDone: false,
+    ncTimer1: null, ncTimer2: null, ncTimer2b: null, ncTimer3: null,
+    ncLoginRetryTimer: null, ncLoginTries: 0, ncLoginDone: false, ncSecondSends: 0, ncSurvivalDone: false,
     afkMode: opts.afkMode !== undefined ? opts.afkMode : (ex?.afkMode ?? 'off'),
     afkIntervalMs: clampInterval(opts.afkIntervalMs !== undefined ? opts.afkIntervalMs : ex?.afkIntervalMs),
     autoChatMsg: opts.autoChatMsg !== undefined ? opts.autoChatMsg : (ex?.autoChatMsg ?? null),
@@ -1164,13 +1403,18 @@ async function spawnBot(name, host, port, version, chatId, ownerUsername, opts =
           `Use 🟢 Reconnect when you want to try again.`);
         return;
       }
-      const delay = current.cooldownUntil - now;
+      const cdDelay = current.cooldownUntil - now;
+      // Same stagger as normal retries: bots sharing this IP's cooldown would
+      // otherwise all rejoin in the same tick when it expires and trip it again.
+      const stagger = staggerExtraMs(host, port, name);
+      const delay = cdDelay + stagger;
+      const staggerNote = stagger > 0 ? ' — staggered rejoin with the other bots on this server' : '';
       current.status = 'offline';
       current.error = `Antibot cooldown — waiting ${Math.round(delay / 1000)}s`;
       saveData();
       notify(chatId,
         `⏳ <b>${esc(name)}</b> — the antibot is rate-limiting this IP, not asking for a captcha.\n` +
-        `Waiting <b>${humanInterval(delay)}</b> before the next try (retrying sooner restarts the server's own timer).`);
+        `Waiting <b>${humanInterval(delay)}</b> before the next try${staggerNote} (retrying sooner restarts the server's own timer).`);
       current.reconnectTimer = setTimeout(() => {
         const latest = mcBots.get(name);
         if (!latest || latest !== info || !latest.autoReconnect) return;
@@ -1186,14 +1430,19 @@ async function spawnBot(name, host, port, version, chatId, ownerUsername, opts =
 
     current.reconnectAttempts++;
     const isTimeout = !!current.timeoutConnected;
-    const delay = retryDelay(current.reconnectAttempts, isTimeout);
+    // When several bots on this same server fell together (a server restart),
+    // spread their rejoins so they don't all hammer the server the moment it
+    // comes back and trip its rate limit. A lone bot keeps the plain ~4s beat.
+    const stagger = staggerExtraMs(host, port, name);
+    const delay = retryDelay(current.reconnectAttempts, isTimeout) + stagger;
     const marker = isTimeout ? ' (no keepalive — server stalled or restarting)' : '';
-    // Fixed ~4s retries can run for a long time; announce the first three
+    const staggerNote = stagger > 0 ? ' — staggered rejoin with the other bots on this server' : '';
+    // Fixed retries can run for a long time; announce the first three
     // attempts, then only every 15th (~once a minute) so a long outage can't
     // flood the chat. Every attempt still goes to the log.
     const att = current.reconnectAttempts;
     if (att <= 3 || att % 15 === 0) {
-      notify(chatId, `🔄 <b>${esc(name)}</b> reconnecting in ${Math.round(delay / 1000)}s (attempt ${att})${marker}…`);
+      notify(chatId, `🔄 <b>${esc(name)}</b> reconnecting in ${Math.round(delay / 1000)}s (attempt ${att})${marker}${staggerNote}…`);
     } else {
       console.log(`[${name}] reconnect attempt ${att} (notification throttled)`);
     }
@@ -1530,12 +1779,28 @@ async function spawnBot(name, host, port, version, chatId, ownerUsername, opts =
     if (!clean) return;
 
     // Auto-login: react the moment the server asks, and stop retrying once it confirms.
-    if (info.loginCmd && info.loginEnabled !== false) {
+    // When the Neocraft flow is enabled it owns the login line — answering here
+    // too would send it twice.
+    if (info.loginCmd && info.loginEnabled !== false && !(info.ncEnabled && info.ncLogin)) {
       if (LOGIN_OK_RE.test(clean)) {
         stopLogin(info);
         info.loginDone = true;
       } else if (!info.loginDone && LOGIN_PROMPT_RE.test(clean)) {
         sendLogin(info, 'server prompt');
+      }
+    }
+
+    // Neocraft flow owns the login line when enabled: it answers the server's
+    // own prompt right away (instead of waiting for the blind join timer),
+    // treats the lobby-transfer lines as the green light for the 2nd command,
+    // and stops repeating /survival once the server confirms the transfer.
+    if (info.ncEnabled && info.ncLogin) {
+      if (info.ncSecond && !info.ncSurvivalDone && NC_SURVIVAL_OK_RE.test(clean)) {
+        onNcSurvivalConfirmed(info);
+      } else if (LOGIN_OK_RE.test(clean) || NC_LOGGED_IN_RE.test(clean)) {
+        onNcLoginConfirmed(info);
+      } else if (!info.ncLoginDone && LOGIN_PROMPT_RE.test(clean)) {
+        sendNcLogin(info, 'server prompt');
       }
     }
 
@@ -1562,7 +1827,7 @@ bot.command('start', async ctx => {
 });
 
 const HELP_TEXT = () =>
-  `⭐ <b>Help &amp; Usage</b>\n\n<b>➕ Adding a bot</b>\nPress <i>Add Bot</i> then send:\n<code>name  ip  port  [version]</code>\nUse <code>auto</code> as the version to detect the server's own.\n\n<b>Anti-AFK</b> 🏃\nOn a bot's manage screen press <b>Anti-AFK</b>:\n• <b>Jump only</b> — hops in place\n• <b>Walk 1 block</b> — one block forward, one back\n• <b>Jump + Walk</b> — both\nPick any interval from 15s to 30m, or a custom one.\n\n<b>Auto-login</b> 🔐\nPress <b>Set auto-login</b> and send the command your server needs, e.g. <code>/login 1597311</code>. It's saved for that bot and replayed on every reconnect, only when the server asks for it.\n\n<b>Commands</b>\n<code>/bots</code> — list your bots\n<code>/use [name]</code> — pick the bot that runs commands\n<code>/cmd [name] &lt;command&gt;</code> — send a command\n<code>/say &lt;text&gt;</code> — send plain chat\n<code>/click [name] &lt;slot&gt;</code> — click a GUI slot\n<code>/afk [name] &lt;off|jump|walk|both&gt; [interval]</code>\n<code>/setlogin [name] &lt;command&gt;</code>\n<code>/console [name]</code> — open a bot's console\n<code>/players [name]</code> — list everyone on the server\n<code>/forward @you</code> — forward server chat to a group\n\nAnything else starting with <code>/</code> goes straight to the server.`;
+  `⭐ <b>Help &amp; Usage</b>\n\n<b>➕ Adding a bot</b>\nPress <i>Add Bot</i> then send:\n<code>name  ip  port  [version]</code>\nUse <code>auto</code> as the version to detect the server's own.\n\n<b>Anti-AFK</b> 🏃\nOn a bot's manage screen press <b>Anti-AFK</b>:\n• <b>Jump only</b> — hops in place\n• <b>Walk 1 block</b> — one block forward, one back\n• <b>Jump + Walk</b> — both\nPick any interval from 15s to 30m, or a custom one.\n\n<b>Auto-login</b> 🔐\nPress <b>Set auto-login</b> and send the command your server needs, e.g. <code>/login 1597311</code>. It's saved for that bot and replayed on every reconnect, only when the server asks for it.\n\n<b>Commands</b>\n<code>/bots</code> — list your bots\n<code>/use [name]</code> — pick the bot that runs commands\n<code>/cmd [name] &lt;command&gt;</code> — send a command\n<code>/say &lt;text&gt;</code> — send plain chat\n<code>/click [name] &lt;slot&gt;</code> — click a GUI slot\n<code>/afk [name] &lt;off|jump|walk|both&gt; [interval]</code>\n<code>/setlogin [name] &lt;command&gt;</code>\n<code>/console [name]</code> — open a bot's console\n<code>/players [name]</code> — list everyone on the server\n<code>/status</code> — show host CPU and RAM usage\n<code>/forward @you</code> — forward server chat to a group\n\nAnything else starting with <code>/</code> goes straight to the server.`;
 
 bot.command('help', async ctx => {
   await ctx.reply(HELP_TEXT(), {
@@ -1639,6 +1904,69 @@ function playersText(info) {
 const playersKeyboard = name => new InlineKeyboard()
   .text('🔄 Refresh', `players:${name}`)
   .text('⚙️ Manage', `manage:${name}`).row();
+
+// --- host status ---
+// CPU/RAM of the machine this manager runs on (VPS / Docker / Railway) —
+// not the Minecraft server itself, which exposes no resource stats over the protocol.
+const CPU_SAMPLE_MS = 500;
+
+const snapCpus = () => os.cpus().map(c => ({ ...c.times }));
+
+function cpuUsage(a, b) {
+  let idle = 0, total = 0;
+  for (let i = 0; i < a.length && i < b.length; i++) {
+    const idleD = b[i].idle - a[i].idle;
+    const totD = (b[i].user - a[i].user) + (b[i].nice - a[i].nice) + (b[i].sys - a[i].sys) + (b[i].irq - a[i].irq) + idleD;
+    idle += idleD;
+    total += totD;
+  }
+  return total > 0 ? Math.max(0, Math.min(100, (1 - idle / total) * 100)) : 0;
+}
+
+const fmtMB = b => `${(b / 1048576).toFixed(0)} MB`;
+const sleep = ms => new Promise(r => setTimeout(r, ms));
+
+async function statusText() {
+  const before = snapCpus();
+  await sleep(CPU_SAMPLE_MS);
+  const cpu = cpuUsage(before, snapCpus());
+
+  const totalMem = os.totalmem(), usedMem = totalMem - os.freemem();
+  const memPct = totalMem ? (usedMem / totalMem) * 100 : 0;
+
+  const { heapUsed, rss } = process.memoryUsage();
+  const heapLimit = v8.getHeapStatistics().heap_size_limit || 0;
+  const heapPct = heapLimit ? (heapUsed / heapLimit) * 100 : 0;
+
+  let online = 0;
+  for (const b of mcBots.values()) if (b.status === 'online') online++;
+
+  const bar = pct => {
+    const n = Math.round(pct / 10);
+    return '█'.repeat(n) + '░'.repeat(10 - n);
+  };
+
+  return `<b>Server Status</b>\n\n` +
+    `<b>CPU:</b> ${cpu.toFixed(1)}%  ${bar(cpu)} <i>(${os.cpus().length} cores)</i>\n` +
+    `<b>RAM:</b> ${fmtMB(usedMem)} / ${fmtMB(totalMem)} (${memPct.toFixed(1)}%)  ${bar(memPct)}\n` +
+    `<b>Bot process:</b> heap ${fmtMB(heapUsed)}${heapLimit ? ` / ${fmtMB(heapLimit)} (${heapPct.toFixed(0)}%)` : ''} · RSS ${fmtMB(rss)}\n\n` +
+    `<b>Bots:</b> ${online} online / ${mcBots.size} registered\n` +
+    `<b>Uptime:</b> bot ${uptime(process.uptime() * 1000)} · host ${uptime(os.uptime() * 1000)}`;
+}
+
+const statusKeyboard = () => new InlineKeyboard()
+  .text('Refresh', 'status').row()
+  .text('< Back', 'main_menu');
+
+bot.command('status', async ctx => {
+  const wait = await ctx.reply('Measuring CPU…', { parse_mode: 'HTML' }).catch(() => null);
+  const text = await statusText();
+  if (wait) {
+    await bot.api.editMessageText(ctx.chat.id, wait.message_id, text, { parse_mode: 'HTML', reply_markup: statusKeyboard() }).catch(() => {});
+  } else {
+    await ctx.reply(text, { parse_mode: 'HTML', reply_markup: statusKeyboard() });
+  }
+});
 
 bot.command('players', async ctx => {
   const parts = ctx.message.text.trim().split(/\s+/).slice(1);
@@ -1917,6 +2245,13 @@ bot.on('callback_query:data', async ctx => {
     chatStates.delete(chatId);
     await edit(botListText(ctx), botListKeyboard(ctx));
     return answer();
+  }
+
+  if (data === 'status') {
+    chatStates.delete(chatId);
+    answer('Measuring CPU…');
+    await edit(await statusText(), statusKeyboard());
+    return;
   }
 
   if (data === 'add_bot') {
@@ -2567,6 +2902,7 @@ bot.api.setMyCommands([
   { command: 'setlogin', description: 'Save the login command for a bot' },
   { command: 'console', description: "Open a bot's console" },
   { command: 'players', description: 'List everyone online on the server' },
+  { command: 'status', description: 'Show host CPU and RAM usage' },
   { command: 'click', description: 'Click a slot in an open GUI (captcha)' },
   { command: 'forward', description: 'Forward server chat to this group' },
   { command: 'unforward', description: 'Stop forwarding here' },

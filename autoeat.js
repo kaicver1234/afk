@@ -65,7 +65,7 @@ async function tryEat(info, why) {
   if (!food) {
     // Only nag once per hurt spell, not every health tick.
     if (!info.eatWarnedAt || Date.now() - info.eatWarnedAt > 60000) {
-      info.eatWarnedAt = Date.now;
+      info.eatWarnedAt = Date.now();
       info.error = `Hurt — no food in inventory`;
     }
     return false;
