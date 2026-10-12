@@ -5,6 +5,7 @@ const mineflayer = require('mineflayer');
 const { DEFAULT_FINGERPRINT, isCooldownKick, parseCooldownMs } = require('./antibot');
 const autoEat = require('./autoeat');
 const { validateBackup } = require('./backup');
+const { readChat } = require('./chat');
 const fs = require('fs');
 const net = require('net');
 const os = require('os');
@@ -218,66 +219,8 @@ const ownerTag = b => b.ownerUsername ? `@${b.ownerUsername}` : `#${b.chatId}`;
 
 const notify = (chatId, text) => bot.api.sendMessage(chatId, text, { parse_mode: 'HTML' }).catch(() => {});
 
-// Flatten anything the server might hand us — a ChatMessage, a raw JSON string,
-// or a nested {text, extra:[...]} tree — into plain readable text.
-function readChat(input) {
-  if (input == null) return '';
-  let node = input;
-
-  if (typeof node === 'string') {
-    const s = node.trim();
-    if (!s.startsWith('{') && !s.startsWith('[')) return stripCodes(s);
-    try { node = JSON.parse(s); } catch (_) { return stripCodes(s); }
-  }
-
-  // mineflayer's ChatMessage renders the whole component tree itself.
-  if (typeof node?.toAnsi === 'function') {
-    try {
-      const s = stripCodes(node.toAnsi());
-      if (s) return s;
-    } catch (_) {}
-  }
-
-  // Try toString() method if available
-  if (typeof node?.toString === 'function' && node.toString !== Object.prototype.toString) {
-    try {
-      const s = stripCodes(node.toString());
-      if (s && s !== '[object Object]') return s;
-    } catch (_) {}
-  }
-
-  const walk = n => {
-    if (n == null) return '';
-    if (typeof n === 'string') return n;
-    if (Array.isArray(n)) return n.map(walk).join('');
-    let out = '';
-    if (typeof n.text === 'string') out += n.text;
-    else if (typeof n.translate === 'string') out += n.translate;
-    else if (typeof n.reason === 'string') out += n.reason;
-    else if (typeof n.message === 'string') out += n.message;
-    if (Array.isArray(n.with)) out += ' ' + n.with.map(walk).join(' ');
-    if (Array.isArray(n.extra)) out += n.extra.map(walk).join('');
-    return out;
-  };
-
-  const flat = stripCodes(walk(node));
-  if (flat) return flat;
-  
-  // Last resort: try to extract any string values from the object
-  try {
-    if (typeof node === 'object') {
-      const values = Object.values(node).filter(v => typeof v === 'string').join(' ');
-      if (values) return stripCodes(values);
-    }
-    return stripCodes(String(node));
-  } catch (_) { return ''; }
-}
-
-const stripCodes = s => String(s)
-  .replace(/\x1b\[[0-9;]*m/g, '')
-  .replace(/§[0-9a-fk-or]/gi, '')
-  .replace(/[ \t]+/g, ' ')
-  .trim();
+// readChat / stripCodes live in chat.js (they also unwrap the prismarine-nbt
+// shape of 1.20.3+ kick reasons — see that file for the details).
 
 // Telegram commands owned by this bot — never relayed to Minecraft.
 const RESERVED = new Set([
@@ -1659,10 +1602,16 @@ async function spawnBot(name, host, port, version, chatId, ownerUsername, opts =
             r = JSON.stringify(reason);
           }
         }
-        // Detect common antibot patterns
+        // Detect common antibot patterns.
+        // NOTE: do NOT match the bare word "compound" here — that check used
+        // to exist and matched nothing real: "compound" is the *type tag* of a
+        // prismarine-nbt chat component ({type:'compound', value:{…}}), which
+        // the old parser flattened to that single word, mislabelling every
+        // NBT-wrapped kick (1.20.3+/Via*) as an antibot rejection. The real
+        // reason text now comes through readChat (see chat.js).
         const lowerR = r.toLowerCase();
         if (/\b(antibot|anti-bot|captcha|verif|human check|not a robot|solve|challenge)\b/i.test(lowerR) ||
-            lowerR.includes('compound') || lowerR.includes('denied from entering') ||
+            lowerR.includes('denied from entering') ||
             lowerR.includes('bot detected') || lowerR.includes('failed the check') ||
             (lowerR.includes('denied') && !info.wasEverOnline && info.reconnectAttempts === 0)) {
           isAntiBot = true;

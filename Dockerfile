@@ -13,7 +13,7 @@ WORKDIR /app
 COPY package.json package-lock.json ./
 RUN npm ci --omit=dev && npm cache clean --force
 
-COPY index.js antibot.js autoeat.js ./
+COPY index.js antibot.js autoeat.js backup.js chat.js ./
 
 # Railway mounts volumes root-owned while this image runs as `node`, so the
 # entrypoint must start as root, chown /data once, then drop back via gosu.
